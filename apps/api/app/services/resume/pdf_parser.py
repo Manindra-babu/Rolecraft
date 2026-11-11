@@ -327,10 +327,13 @@ def _order_and_merge_paragraphs(lines: list[dict[str, Any]], page_width: float) 
         # Label prefix like 'Optimization:', 'Deployment:', 'Tools:' starts a new paragraph/bullet
         if re.match(r"^[A-Z][A-Za-z &/+]{1,28}:\s", nxt["text"]):
             return False
-        # Previous line ended with a sentence period and next line starts with a strong resume action verb
-        if prev["text"].rstrip().endswith(".") and re.match(
-            r"^(?:Built|Developed|Collaborated|Engineered|Implemented|Designed|Created|Managed|Led|Integrated|Optimized|Deployed|Architected|Tested|Automated|Worked|Participated|Gained)\b",
-            nxt["text"],
+        # Previous line ended with a sentence period and next line starts a new item (action verb, ranking, or titled award)
+        if prev["text"].rstrip().endswith(".") and (
+            re.match(
+                r"^(?:Built|Developed|Collaborated|Engineered|Implemented|Designed|Created|Managed|Led|Integrated|Optimized|Deployed|Architected|Tested|Automated|Worked|Participated|Gained|Top\s+\d+|Cleared|Awarded|Winner|Finalist)\b",
+                nxt["text"],
+            )
+            or re.match(r"^[A-Z][A-Za-z0-9 &/+()-]{2,36}\s[-–]\s[A-Z]", nxt["text"])
         ):
             return False
         # Horizontal alignment / indentation shift (> 10pt except hanging indent)

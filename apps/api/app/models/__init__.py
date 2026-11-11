@@ -1,4 +1,10 @@
-from app.models.application import Application, Change, ResumeVersion, SkillAssessment
+from app.models.application import (
+    Application,
+    Change,
+    GitHubConfirmJob,
+    ResumeVersion,
+    SkillAssessment,
+)
 from app.models.github import GitHubAnalysis
 from app.models.job import JobPosting
 from app.models.learning import LearningPlan, LearningProgress
@@ -16,6 +22,7 @@ __all__ = [
     "ResumeVersion",
     "Change",
     "SkillAssessment",
+    "GitHubConfirmJob",
     "LearningPlan",
     "LearningProgress",
     "LLMCache",

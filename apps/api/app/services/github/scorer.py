@@ -5,6 +5,7 @@ from typing import Any
 
 from app.schemas.github import (
     AnalyzedRepo,
+    BulletEvidenceItem,
     DetectedGitHubSkill,
     RepoEvidenceSignals,
     RepoRecommendation,
@@ -294,7 +295,7 @@ def rank_repos_for_job(
                 f"(quality score {repo.quality_score:.0f}/100)."
             )
 
-        draft_bullets = build_factual_repo_bullets(repo)
+        draft_bullets, bullet_evidence = build_factual_repo_bullets_with_evidence(repo)
         recs.append(
             RepoRecommendation(
                 repo_name=repo.name,
@@ -306,6 +307,7 @@ def rank_repos_for_job(
                 reason=reason,
                 already_in_resume=already_in,
                 draft_bullets=draft_bullets,
+                bullet_evidence=bullet_evidence,
             )
         )
 
@@ -313,19 +315,240 @@ def rank_repos_for_job(
     return recs
 
 
-def build_factual_repo_bullets(repo: AnalyzedRepo) -> list[str]:
-    """Generate factual, evidence-only starter bullets directly from repo metadata."""
-    bullets: list[str] = []
-    techs = ", ".join(repo.inferred_skills[:5]) or repo.primary_language or "software components"
-    if repo.description:
-        bullets.append(f"Built {repo.name} ({techs}): {repo.description.rstrip('.')}.")
-    else:
-        bullets.append(f"Developed {repo.name} using {techs} across {repo.signals.file_count} source files.")
+_NOISY_LANG_TOKENS = {
+    "powershell", "batchfile", "makefile", "shell", "dockerfile", "html", "css", "scss",
+}
+_TRIVIAL_COMMIT_RE = re.compile(
+    r"^(?:initial commit|init|update(?: readme)?|wip|fix(?: typo)?|merge (?:branch|pull request)|cleanup|minor)\b",
+    re.IGNORECASE,
+)
+_README_BOILERPLATE_RE = re.compile(
+    r"(?:npm install|pip install|uvicorn|docker-compose|git clone|mit license|apache license|table of contents|getting started|prerequisites|environment variables)",
+    re.IGNORECASE,
+)
 
-    if repo.signals.has_tests and repo.signals.has_ci:
-        bullets.append("Implemented automated tests and CI workflows to validate code changes.")
-    elif repo.signals.has_tests:
-        bullets.append("Added automated test coverage to verify core module behavior.")
+
+def _clean_readme_sentences(readme_excerpt: str, repo_name: str) -> list[str]:
+    """Extract clean, human-readable project summary sentences from a README excerpt."""
+    if not readme_excerpt.strip():
+        return []
+    text = re.sub(r"```[\s\S]*?```", " ", readme_excerpt)
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    out: list[str] = []
+    repo_clean = repo_name.lower().replace("-", " ").replace("_", " ")
+    for raw_line in text.splitlines():
+        line = re.sub(r"^[\s#>*\-•]+", "", raw_line).strip()
+        line = line.replace("`", "")
+        line = re.sub(r"\s+", " ", line).strip()
+        if len(line) < 24 or len(line) > 200:
+            continue
+        if line.lower().replace("-", " ").replace("_", " ") == repo_clean:
+            continue
+        if _README_BOILERPLATE_RE.search(line) or "http://" in line or "https://" in line:
+            continue
+        # Strip trailing colon headings
+        if line.endswith(":"):
+            continue
+        out.append(line.rstrip("."))
+    return out
+
+
+def _select_stack_highlights(repo: AnalyzedRepo) -> list[str]:
+    """Select concise key technologies (frameworks + primary languages), avoiding noisy file-type dumps."""
+    preferred: list[str] = []
+    seen_lower: set[str] = set()
+    # First prioritize mapped dependencies (FastAPI, React, Next.js, etc.)
+    for dep in repo.dependencies:
+        mapped = DEPENDENCY_SKILL_MAP.get(dep.lower().strip())
+        cand = mapped or (dep.strip() if len(dep.strip()) <= 20 else "")
+        if cand and cand.lower() not in seen_lower and cand.lower() not in {"pytest"}:
+            preferred.append(cand)
+            seen_lower.add(cand.lower())
+    # Then inferred skills excluding shell/markup noise
+    for sk in repo.inferred_skills:
+        if sk.lower() in _NOISY_LANG_TOKENS or sk.lower() in seen_lower:
+            continue
+        preferred.append(sk)
+        seen_lower.add(sk.lower())
+    if not preferred and repo.primary_language:
+        preferred.append(repo.primary_language)
+    elif not preferred:
+        for sk in repo.inferred_skills[:3]:
+            if sk.lower() not in seen_lower:
+                preferred.append(sk)
+                seen_lower.add(sk.lower())
+    return preferred[:3]
+
+
+def _extract_test_coverage_bullet(repo: AnalyzedRepo) -> tuple[str, str] | None:
+    """Return a concrete test coverage bullet naming real test files/modules, or None."""
+    if not repo.signals.has_tests:
+        return None
+    test_paths = [
+        p
+        for p in (repo.test_files or repo.key_files)
+        if "test" in p.lower() or ".spec." in p.lower()
+    ]
+    # Keep distinct code test files (skip cache/snapshot junk)
+    clean_paths = [
+        p
+        for p in dict.fromkeys(test_paths)
+        if not any(skip in p.lower() for skip in ("__pycache__", "node_modules", ".snap"))
+    ]
+    if not clean_paths:
+        return None
+
+    topics: list[str] = []
+    for path in clean_paths:
+        stem = path.rsplit("/", 1)[-1].split(".")[0]
+        stem = re.sub(r"^(?:test_|spec_)", "", stem, flags=re.IGNORECASE)
+        stem = re.sub(r"(?:_test|\.test|_spec|\.spec)$", "", stem, flags=re.IGNORECASE)
+        topic = stem.replace("_", " ").replace("-", " ").strip()
+        if topic and topic.lower() not in {"all", "app", "main", "index", "unit", "integration", "tests", "test"}:
+            if topic.lower() not in {t.lower() for t in topics}:
+                topics.append(topic)
+
+    cited = ", ".join(clean_paths[:2])
+    if topics:
+        topic_str = ", ".join(topics[:3])
+        return (
+            f"Wrote automated tests covering {topic_str} ({cited}).",
+            f"Test files: {cited}",
+        )
+    return (
+        f"Implemented automated tests verified in {cited}.",
+        f"Test files: {cited}",
+    )
+
+
+def _format_commit_contribution(repo: AnalyzedRepo, stack: list[str]) -> tuple[str, str] | None:
+    """Turn non-trivial commit messages into one concrete engineering contribution bullet."""
+    highlights: list[str] = []
+    for msg in repo.commit_messages:
+        clean = re.sub(r"^(?:feat|fix|refactor|perf|chore|docs)(?:\([^)]*\))?:\s*", "", msg.strip(), flags=re.I)
+        clean = re.sub(r"\s+", " ", clean).strip().rstrip(".")
+        if len(clean) < 15 or _TRIVIAL_COMMIT_RE.match(clean):
+            continue
+        if clean.lower() not in {h.lower() for h in highlights}:
+            highlights.append(clean)
+        if len(highlights) >= 2:
+            break
+    if not highlights:
+        return None
+    if len(highlights) == 1:
+        summary = highlights[0]
+        summary = summary[0].lower() + summary[1:] if len(summary) > 1 and summary[1].islower() else summary
+        bullet = f"Implemented repository enhancements including {summary}."
+    else:
+        bullet = f"Engineered key changes including {highlights[0]} and {highlights[1]}."
+    return bullet, f"Recent commits ({len(highlights)} highlighted)"
+
+
+def build_factual_repo_bullets_with_evidence(
+    repo: AnalyzedRepo,
+) -> tuple[list[str], list[BulletEvidenceItem]]:
+    """
+    Generate honest, resume-style project bullets strictly grounded in README, code/dependencies,
+    commit history, and real test files (never emitting file counts, bare language dumps, or generic test claims).
+    """
+    bullets: list[str] = []
+    evidence: list[BulletEvidenceItem] = []
+
+    stack = _select_stack_highlights(repo)
+    stack_phrase = " and ".join(stack) if len(stack) <= 2 else ", ".join(stack[:-1]) + f", and {stack[-1]}"
+    readme_sentences = _clean_readme_sentences(repo.readme_excerpt, repo.name)
+    desc = re.sub(r"\s+", " ", (repo.description or "").strip()).rstrip(".")
+
+    # Bullet 1: What the project does + core stack
+    summary_text = desc or (readme_sentences[0] if readme_sentences else "")
+    summary_source = "Repository description + dependencies" if desc else "README + dependencies"
+    if summary_text:
+        # Lowercase leading article/adjective if joining cleanly with ", a ..." or description phrase
+        normalized_summary = summary_text
+        if normalized_summary and not normalized_summary.startswith((repo.name, "API", "AI", "ML", "UI")):
+            if len(normalized_summary) > 1 and normalized_summary[0].isupper() and normalized_summary[1].islower():
+                normalized_summary = normalized_summary[0].lower() + normalized_summary[1:]
+        missing_stack = [s for s in stack if s.lower() not in summary_text.lower()]
+        if missing_stack:
+            missing_phrase = (
+                " and ".join(missing_stack)
+                if len(missing_stack) <= 2
+                else ", ".join(missing_stack[:-1]) + f", and {missing_stack[-1]}"
+            )
+            b1 = f"Built {repo.name}, {normalized_summary}, using {missing_phrase}."
+        else:
+            b1 = f"Built {repo.name}, {normalized_summary}."
+        bullets.append(b1)
+        evidence.append(
+            BulletEvidenceItem(
+                bullet=b1,
+                source=summary_source,
+                detail=f"{summary_source} ({', '.join(stack) or repo.primary_language or 'repository'})",
+            )
+        )
+    else:
+        modules = [f.split("/")[0] for f in repo.key_files if "/" in f]
+        top_modules = list(dict.fromkeys(m for m in modules if not m.startswith(".")))[:2]
+        mod_note = f" across {' and '.join(top_modules)} modules" if top_modules else ""
+        b1 = f"Developed {repo.name} using {stack_phrase or 'modular software architecture'}{mod_note}."
+        bullets.append(b1)
+        evidence.append(
+            BulletEvidenceItem(
+                bullet=b1,
+                source="Code structure + dependencies",
+                detail=f"Inferred from {', '.join(repo.key_files[:3]) or repo.full_name}",
+            )
+        )
+
+    # Bullet 2: User contribution from second README detail, real commit history, or Docker/CI/tests
+    second_readme = ""
+    for sent in readme_sentences:
+        if sent.lower() != summary_text.lower():
+            second_readme = sent
+            break
+
+    commit_pair = _format_commit_contribution(repo, stack)
+    test_pair = _extract_test_coverage_bullet(repo)
+
+    if commit_pair:
+        b2, detail2 = commit_pair
+        bullets.append(b2)
+        evidence.append(BulletEvidenceItem(bullet=b2, source="Commit history", detail=detail2))
+    elif second_readme:
+        b2 = f"{second_readme}."
+        bullets.append(b2)
+        evidence.append(
+            BulletEvidenceItem(bullet=b2, source="README", detail=f"README feature documentation ({repo.full_name})")
+        )
+    elif repo.signals.has_dockerfile and repo.signals.has_ci:
+        b2 = "Configured Docker containerization and GitHub Actions CI workflows for reproducible builds."
+        bullets.append(b2)
+        evidence.append(
+            BulletEvidenceItem(
+                bullet=b2,
+                source="Repository config",
+                detail="Dockerfile & .github/workflows present in repo tree",
+            )
+        )
     elif repo.signals.has_dockerfile:
-        bullets.append("Configured Docker containerization for reproducible local and deployment environments.")
+        b2 = "Containerized the application with Docker for consistent local and deployment runs."
+        bullets.append(b2)
+        evidence.append(
+            BulletEvidenceItem(bullet=b2, source="Repository config", detail="Dockerfile present in repo tree")
+        )
+
+    if test_pair and len(bullets) < 3:
+        bt, dt = test_pair
+        if bt not in bullets:
+            bullets.append(bt)
+            evidence.append(BulletEvidenceItem(bullet=bt, source="Automated tests", detail=dt))
+
+    return bullets, evidence
+
+
+def build_factual_repo_bullets(repo: AnalyzedRepo) -> list[str]:
+    """Generate factual, evidence-only starter bullets directly from repo README, code, commits, and tests."""
+    bullets, _ = build_factual_repo_bullets_with_evidence(repo)
     return bullets

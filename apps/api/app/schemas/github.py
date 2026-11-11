@@ -30,6 +30,8 @@ class AnalyzedRepo(BaseModel):
     dependencies: list[str] = Field(default_factory=list)
     inferred_skills: list[str] = Field(default_factory=list)
     key_files: list[str] = Field(default_factory=list)
+    test_files: list[str] = Field(default_factory=list)
+    commit_messages: list[str] = Field(default_factory=list)
     readme_excerpt: str = ""
     stars: int = 0
     pushed_at: Optional[str] = None
@@ -63,6 +65,12 @@ class GitHubAnalysisResponse(BaseModel):
     fetched_at: Optional[datetime] = None
 
 
+class BulletEvidenceItem(BaseModel):
+    bullet: str
+    source: str
+    detail: str
+
+
 class RepoRecommendation(BaseModel):
     repo_name: str
     full_name: str
@@ -73,4 +81,5 @@ class RepoRecommendation(BaseModel):
     reason: str
     already_in_resume: bool = False
     draft_bullets: list[str] = Field(default_factory=list)
+    bullet_evidence: list[BulletEvidenceItem] = Field(default_factory=list)
     decision: str = "pending"  # pending | approved | rejected

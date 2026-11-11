@@ -151,7 +151,17 @@ def validate_claim_against_evidence(
     if re.search(r"\b([A-Za-z]{3,}-)\s+\1", stripped_new, re.I):
         integrity_errors.append("Integrity check failed: duplicated hyphenated word detected.")
 
-    # Skill category & trailing period check
+    # Reject generic repository metadata filler anywhere
+    if re.search(
+        r"(?:added automated test coverage to verify core module behavior|across \d+ source files?)",
+        stripped_new,
+        re.I,
+    ):
+        integrity_errors.append(
+            "Integrity check failed: generic repository metadata filler is not allowed."
+        )
+
+    # Skill category, leading comma & trailing period check
     if section == "skills":
         orig_cat_m = re.match(r"^\s*([A-Za-z][A-Za-z &/+]{1,35}):\s*", original_text or "")
         if orig_cat_m:
@@ -161,6 +171,8 @@ def validate_claim_against_evidence(
                     f"Integrity check failed: skill category label '{expected_label}:' must be preserved."
                 )
         skills_body = stripped_new.split(":", 1)[1] if ":" in stripped_new else stripped_new
+        if skills_body.lstrip().startswith((",", ";", "|")):
+            integrity_errors.append("Integrity check failed: leading comma/separator in skills list.")
         raw_parts = [p.strip() for p in re.split(r"[,|;]+", skills_body) if p.strip()]
         if not raw_parts:
             integrity_errors.append("Integrity check failed: skills line contains no skill items.")

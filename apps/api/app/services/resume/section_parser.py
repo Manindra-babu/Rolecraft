@@ -366,7 +366,12 @@ def parse_lines_to_structure(
                 current_edu.dates = dates2
             current_edu.element_ids.append(el["id"])
         elif current_edu is not None and (not _looks_like_subheading(el, raw) or current_edu.institution):
-            # Lines below degree/institution line inside Education become details
+            # Lines below degree/institution line inside Education become details in original reading order
+            cleaned_d = strip_bullet_prefix(raw)
+            if cleaned_d:
+                current_edu.details.append(cleaned_d)
+                current_edu.element_ids.append(el["id"])
+        elif current_edu is not None and re.match(r"^(?:Top\s+\d+|Participated|Gained|Cleared|Awarded)\b", raw, re.I):
             cleaned_d = strip_bullet_prefix(raw)
             if cleaned_d:
                 current_edu.details.append(cleaned_d)
@@ -374,6 +379,15 @@ def parse_lines_to_structure(
         else:
             if current_edu is not None and (current_edu.institution or current_edu.degree):
                 structure.education.append(current_edu)
+            if re.match(r"^(?:Top\s+\d+|Participated|Gained|Cleared|Awarded)\b", raw, re.I):
+                current_edu = ParsedEducationItem(
+                    institution="",
+                    degree="",
+                    dates="",
+                    details=[strip_bullet_prefix(raw)],
+                    element_ids=[el["id"]],
+                )
+                continue
             inst, deg, dates = _split_title_company(raw)
             # If first line looks like a degree (e.g., Bachelor of Technology...), store in degree
             if re.search(r"\b(bachelor|master|b\.?tech|m\.?tech|b\.?s\.?|m\.?s\.?|ph\.?d|diploma)\b", raw, re.I) and not dates:

@@ -25,7 +25,10 @@ from app.services.resume.pdf_editor import (
 )
 from app.services.resume.pdf_parser import parse_pdf_resume
 from app.services.resume.section_parser import parse_lines_to_structure
-from app.services.resume.theme_verifier import verify_pdf_theme_match
+from app.services.resume.theme_verifier import (
+    verify_exported_pdf_completeness,
+    verify_pdf_theme_match,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 MANINDRA_PDF = FIXTURES_DIR / "resumes" / "manindra_resume.pdf"
@@ -403,3 +406,412 @@ def test_strategy_b_c_d_pdf_theme_preservation_and_docx_fallback(tmp_path: Path)
                 ],
             )
             assert edited_docx.exists()
+
+
+def test_round3_inplace_2col_github_grid_completeness_and_overflow(tmp_path: Path) -> None:
+    from app.schemas.github import AnalyzedRepo, BulletEvidenceItem, RepoEvidenceSignals, RepoRecommendation
+
+    parsed, elem_map, raw_text, _ = parse_pdf_resume(MANINDRA_PDF)
+    job = _load_paypal_job()
+
+    # 1. Exact reading order of Education hackathon achievement (never swapped)
+    assert parsed.education
+    edu_details = " ".join(parsed.education[0].details)
+    assert (
+        "Top 10 Qualifier - Google-Hosted Hackathon: Cleared multiple screening levels "
+        "demonstrating strong emergency response network system."
+    ) in edu_details
+    assert "Google-Hosted Hackathon: Cleared multiple screening levels demonstrating strong emergency — Top 10 Qualifier" not in edu_details
+
+    # 2. Validator rejects leading commas and generic GitHub metadata filler
+    bad_skill = validate_claim_against_evidence(
+        new_text="Tools: , Microsoft Excel, Linux",
+        original_text="Tools: Microsoft Excel, Linux",
+        resume=parsed,
+        raw_resume_text=raw_text,
+        section="skills",
+    )
+    assert bad_skill.status == "blocked"
+    bad_filler = validate_claim_against_evidence(
+        new_text="Added automated test coverage to verify core module behavior.",
+        original_text="",
+        resume=parsed,
+        raw_resume_text=raw_text,
+        section="projects",
+    )
+    assert bad_filler.status == "blocked"
+
+    gh_repos = [
+        AnalyzedRepo(
+            name="Decision-IQ",
+            full_name="Manindra-babu/Decision-IQ",
+            html_url="https://github.com/Manindra-babu/Decision-IQ",
+            description="Interactive AI-powered roadmap generator and decision intelligence platform",
+            primary_language="JavaScript",
+            languages={"JavaScript": 4000, "Python": 3000, "HTML": 500, "CSS": 500},
+            dependencies=["react", "fastapi"],
+            inferred_skills=["JavaScript", "Python", "React", "FastAPI", "HTML", "CSS"],
+            readme_excerpt="Decision-IQ uses FastAPI and dynamic node canvas graphs for learning path tracking.",
+            signals=RepoEvidenceSignals(has_readme=True, file_count=39, total_commits=15, user_commits=15, user_commit_share=1.0),
+        ),
+        AnalyzedRepo(
+            name="Surplus-Food-Donation-Matcher",
+            full_name="Manindra-babu/Surplus-Food-Donation-Matcher",
+            html_url="https://github.com/Manindra-babu/Surplus-Food-Donation-Matcher",
+            description="Autonomous surplus food rescue agent powered by LangGraph, Google Gemini and FastAPI",
+            primary_language="TypeScript",
+            languages={"TypeScript": 3000, "Python": 3000, "HTML": 400, "CSS": 400},
+            dependencies=["fastapi", "langgraph"],
+            inferred_skills=["TypeScript", "Python", "FastAPI", "HTML", "CSS"],
+            readme_excerpt="Food-safety validation, NGO matching and human approval gating using FastAPI and LangGraph.",
+            signals=RepoEvidenceSignals(has_readme=True, file_count=79, total_commits=11, user_commits=11, user_commit_share=1.0),
+        ),
+        AnalyzedRepo(
+            name="AI_Deck",
+            full_name="Manindra-babu/AI_Deck",
+            html_url="https://github.com/Manindra-babu/AI_Deck",
+            description="AI presentation deck generator built with React and Python",
+            primary_language="TypeScript",
+            languages={"TypeScript": 2000, "Python": 1500, "HTML": 300, "CSS": 300},
+            dependencies=["react"],
+            inferred_skills=["TypeScript", "Python", "React", "HTML", "CSS"],
+            readme_excerpt="Generates slide decks with speaker notes and layout templates.",
+            signals=RepoEvidenceSignals(has_readme=True, file_count=64, total_commits=12, user_commits=12, user_commit_share=1.0),
+        ),
+    ]
+    recs2 = [
+        RepoRecommendation(
+            repo_name="Decision-IQ",
+            full_name="Manindra-babu/Decision-IQ",
+            html_url="https://github.com/Manindra-babu/Decision-IQ",
+            quality_score=95,
+            relevance_score=87.4,
+            matched_skills=["React", "JavaScript", "HTML", "Python"],
+            reason="AI roadmap generator",
+            decision="approved",
+            draft_bullets=[
+                "Built an interactive AI-powered roadmap generator and decision intelligence platform using JavaScript, Python, HTML, CSS, and FastAPI featuring dynamic node canvas graphs and learning path tracking."
+            ],
+            bullet_evidence=[BulletEvidenceItem(bullet="Built...", source="README + dependencies", detail="README.md")],
+        ),
+        RepoRecommendation(
+            repo_name="Surplus-Food-Donation-Matcher",
+            full_name="Manindra-babu/Surplus-Food-Donation-Matcher",
+            html_url="https://github.com/Manindra-babu/Surplus-Food-Donation-Matcher",
+            quality_score=95,
+            relevance_score=87.4,
+            matched_skills=["JavaScript", "HTML", "Python", "CSS"],
+            reason="Autonomous food rescue agent",
+            decision="approved",
+            draft_bullets=[
+                "Engineered an autonomous surplus food rescue agent powered by TypeScript, Python, FastAPI, LangGraph, and Gemini with food-safety validation and NGO matching."
+            ],
+            bullet_evidence=[BulletEvidenceItem(bullet="Engineered...", source="README + dependencies", detail="README.md")],
+        ),
+    ]
+
+    changes = generate_tailored_changes(
+        resume=parsed,
+        raw_resume_text=raw_text,
+        element_map=elem_map,
+        job=job,
+        github_repos=gh_repos,
+        approved_github_recs=recs2,
+    )
+    assert all(c["status"] == "pending" for c in changes)
+    assert any(c["section"] == "summary" for c in changes)
+    for c in changes:
+        assert c["validation_status"] != "blocked", f"Unexpected block: {c}"
+        c["status"] = "accepted"
+
+    # 3. Full in-place 2-col export stays 1 page, preserves all untouched text & hyperlinks, adds 2 GITHUB links
+    out_full = tmp_path / "full_optimized.pdf"
+    res_full = apply_changes_to_pdf_in_place(
+        source_pdf_path=MANINDRA_PDF,
+        output_pdf_path=out_full,
+        approved_changes=changes,
+        resume_structure=parsed,
+        tighten_spacing=True,
+    )
+    assert res_full.strategy_used == "inplace_pdf"
+    assert res_full.page_count_original == 1
+    assert res_full.page_count_output == 1
+    assert res_full.overflow_detected is False
+
+    verify_full = verify_pdf_theme_match(
+        original_pdf_path=MANINDRA_PDF,
+        output_pdf_path=out_full,
+        changed_bboxes_by_page=res_full.changed_bboxes_by_page,
+        band_shifts_by_page=res_full.band_shifts_by_page,
+        strategy_used=res_full.strategy_used,
+    )
+    assert verify_full.passed is True, verify_full.blocked_reason
+    assert verify_full.unchanged_similarity_score >= 97.0
+
+    comp_ok, comp_errs = verify_exported_pdf_completeness(
+        original_pdf_path=MANINDRA_PDF,
+        output_pdf_path=out_full,
+        applied_changes=changes,
+    )
+    assert comp_ok is True, comp_errs
+
+    out_doc = fitz.open(str(out_full))
+    out_text = out_doc[0].get_text("text")
+    assert "DECISION-IQ - GITHUB" in out_text
+    assert "SURPLUS-FOOD-DONATION-MATCHER - GITHUB" in out_text
+    assert "https://github.com/Manindra-babu/Decision-IQ" not in out_text
+    assert "core module behavior" not in out_text.lower()
+    out_uris = {l.get("uri") for l in out_doc[0].get_links() if l.get("uri")}
+    assert "https://github.com/Manindra-babu/Decision-IQ" in out_uris
+    assert "https://github.com/Manindra-babu/Surplus-Food-Donation-Matcher" in out_uris
+    # 2-col verification: Surplus-Food-Donation-Matcher placed right of Decision-IQ on similar Y
+    tdict = out_doc[0].get_text("dict")
+    title_x: dict[str, float] = {}
+    for blk in tdict.get("blocks", []):
+        if blk.get("type") == 0:
+            for ln in blk.get("lines", []):
+                txt = "".join(s.get("text", "") for s in ln["spans"])
+                if "DECISION-IQ" in txt:
+                    title_x["left"] = float(ln["bbox"][0])
+                elif "SURPLUS-FOOD" in txt:
+                    title_x["right"] = float(ln["bbox"][0])
+    assert title_x.get("right", 0) > title_x.get("left", 999) + 150.0, f"Expected 2-column placement: {title_x}"
+    out_doc.close()
+
+    # 4. 3-project one-page constraint check -> overflow flagged with 3 concrete options
+    recs3 = recs2 + [
+        RepoRecommendation(
+            repo_name="AI_Deck",
+            full_name="Manindra-babu/AI_Deck",
+            html_url="https://github.com/Manindra-babu/AI_Deck",
+            quality_score=86,
+            relevance_score=80.0,
+            matched_skills=["TypeScript", "Python", "React", "HTML"],
+            reason="AI deck generator",
+            decision="approved",
+            draft_bullets=["Built AI_Deck using React, TypeScript, Python, and HTML to generate slide decks."],
+            bullet_evidence=[BulletEvidenceItem(bullet="Built...", source="README", detail="README.md")],
+        ),
+    ]
+    changes3 = generate_tailored_changes(
+        resume=parsed,
+        raw_resume_text=raw_text,
+        element_map=elem_map,
+        job=job,
+        github_repos=gh_repos,
+        approved_github_recs=recs3,
+    )
+    for c in changes3:
+        c["status"] = "accepted"
+    out_ov = tmp_path / "overflow3.pdf"
+    res_ov = apply_changes_to_pdf_in_place(
+        source_pdf_path=MANINDRA_PDF,
+        output_pdf_path=out_ov,
+        approved_changes=changes3,
+        resume_structure=parsed,
+        tighten_spacing=True,
+    )
+    assert res_ov.overflow_detected is True
+    assert res_ov.page_count_output == 2
+    assert len(res_ov.overflow_suggestions) >= 3
+    joined_opts = " ".join(res_ov.overflow_suggestions).lower()
+    assert "trim" in joined_opts and "drop" in joined_opts and "spacing" in joined_opts
+
+    # 5. Completeness check blocks if content dropped
+    dropped_pdf = tmp_path / "dropped.pdf"
+    ddoc2 = fitz.open()
+    p = ddoc2.new_page()
+    p.insert_text((72, 100), "SUMMARY\nOnly summary present")
+    ddoc2.save(str(dropped_pdf))
+    ddoc2.close()
+    comp_fail, errs_fail = verify_exported_pdf_completeness(
+        original_pdf_path=MANINDRA_PDF,
+        output_pdf_path=dropped_pdf,
+        applied_changes=[],
+    )
+    assert comp_fail is False and errs_fail
+
+
+def test_zero_change_single_span_cache_and_similarity_gate(
+    client: TestClient,
+    db_session,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from app.api.applications import EXPORT_CODE_VERSION, compute_export_cache_key
+    from app.models.application import Application, Change, ResumeVersion
+    from app.models.job import JobPosting
+    from app.models.resume import ResumeFile
+    from app.models.user import User
+
+    # 1. Step 4 gate blocks ANY strategy (even style_clone_fallback) when unchanged similarity < 95%
+    cloned_pdf = tmp_path / "fallback_plain.pdf"
+    build_style_cloned_pdf(
+        source_pdf_path=MANINDRA_PDF,
+        output_pdf_path=cloned_pdf,
+        resume_structure=parse_pdf_resume(MANINDRA_PDF)[0],
+        approved_changes=[],
+    )
+    verify_fallback = verify_pdf_theme_match(
+        original_pdf_path=MANINDRA_PDF,
+        output_pdf_path=cloned_pdf,
+        changed_bboxes_by_page={},
+        strategy_used="style_clone_fallback",
+    )
+    assert verify_fallback.passed is False
+    assert verify_fallback.unchanged_similarity_score < 95.0
+    assert verify_fallback.blocked_reason and "95.0%" in verify_fallback.blocked_reason
+
+    # 2. Step 3 single-span word fix ("RETRIVAL" -> "RETRIEVAL") redacts only that word
+    one_pdf = tmp_path / "one_word_fix.pdf"
+    one_res = apply_changes_to_pdf_in_place(
+        source_pdf_path=MANINDRA_PDF,
+        output_pdf_path=one_pdf,
+        approved_changes=[
+            {
+                "section": "projects",
+                "change_type": "reworded",
+                "target_location": {},
+                "original_text": "RETRIVAL",
+                "new_text": "RETRIEVAL",
+                "status": "accepted",
+            }
+        ],
+        resume_structure=parse_pdf_resume(MANINDRA_PDF)[0],
+    )
+    assert one_res.strategy_used == "inplace_pdf"
+    one_verify = verify_pdf_theme_match(
+        original_pdf_path=MANINDRA_PDF,
+        output_pdf_path=one_pdf,
+        changed_bboxes_by_page=one_res.changed_bboxes_by_page,
+        band_shifts_by_page=one_res.band_shifts_by_page,
+        strategy_used=one_res.strategy_used,
+    )
+    assert one_verify.passed is True
+    assert one_verify.unchanged_similarity_score >= 99.0
+    one_doc = fitz.open(str(one_pdf))
+    one_text = one_doc[0].get_text("text")
+    assert "RETRIEVAL" in one_text
+    assert "RETRIVAL" not in one_text
+    assert "KNOWLEDEGE BASE" in one_text
+    assert any("github.com" in (lk.get("uri") or "").lower() for lk in one_doc[0].get_links())
+    one_doc.close()
+
+    # 3. End-to-end API cache key, invalidation, byte-for-byte 0-change export, and 422 gate
+    reg = client.post(
+        "/api/v1/auth/register",
+        json={"email": "gate@example.com", "password": "StrongPassword123!", "full_name": "Gate Test"},
+    )
+    assert reg.status_code == 201
+    token = reg.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    user = db_session.query(User).filter(User.email == "gate@example.com").first()
+    assert user is not None
+
+    pdf_bytes = MANINDRA_PDF.read_bytes()
+    parsed, elem_map, raw_text, page_count = parse_pdf_resume(MANINDRA_PDF)
+    rf = ResumeFile(
+        user_id=user.id,
+        filename="manindra_resume.pdf",
+        file_type="pdf",
+        file_size=len(pdf_bytes),
+        storage_path=str(tmp_path / "missing_ephemeral.pdf"),
+        file_bytes=pdf_bytes,
+        layout_type="pdf",
+        page_count=page_count,
+        parsed_structure=parsed.model_dump(mode="json"),
+        element_map=elem_map,
+        raw_text=raw_text,
+    )
+    jp = JobPosting(
+        user_id=user.id,
+        title="Software Engineer Intern",
+        company="PayPal",
+        raw_text="Python HTML JavaScript",
+        required_skills=["Python", "HTML", "JavaScript"],
+        preferred_skills=[],
+        responsibilities=[],
+        keywords=[],
+    )
+    db_session.add_all([rf, jp])
+    db_session.flush()
+    app_row = Application(
+        user_id=user.id,
+        resume_file_id=rf.id,
+        job_posting_id=jp.id,
+        status="Draft",
+        compatibility_before=75.0,
+    )
+    db_session.add(app_row)
+    db_session.flush()
+    ver = ResumeVersion(
+        application_id=app_row.id,
+        version_number=1,
+        page_count_original=1,
+        export_cache_key="legacy-stale-key",
+        preview_image_bytes=b"STALE_PNG",
+        output_pdf_bytes=b"STALE_PDF",
+        similarity_score=20.16,
+    )
+    db_session.add(ver)
+    db_session.flush()
+    ch = Change(
+        resume_version_id=ver.id,
+        section="projects",
+        change_type="reworded",
+        target_location={},
+        original_text="RETRIVAL",
+        new_text="RETRIEVAL",
+        reason="Fix typo",
+        validation_status="passed",
+        status="pending",
+    )
+    db_session.add(ch)
+    db_session.commit()
+
+    # Stale preview from legacy code version must NOT be served
+    stale_dl = client.get(f"/api/v1/applications/{app_row.id}/versions/{ver.id}/download/preview", headers=headers)
+    assert stale_dl.status_code == 404
+
+    # Step 2: Export with 0 accepted changes -> byte-for-byte original + >= 98% similarity + no-store
+    exp_zero = client.post(f"/api/v1/applications/{app_row.id}/versions/{ver.id}/export", headers=headers)
+    assert exp_zero.status_code == 200, exp_zero.text
+    z_data = exp_zero.json()
+    assert z_data["similarity_score"] >= 98.0
+    assert z_data["unchanged_similarity_score"] >= 98.0
+    assert z_data["export_cache_key"].startswith(f"{EXPORT_CODE_VERSION}:")
+    dl_zero = client.get(f"/api/v1/applications/{app_row.id}/versions/{ver.id}/download/pdf", headers=headers)
+    assert dl_zero.status_code == 200
+    assert dl_zero.content == pdf_bytes
+    assert "no-store" in dl_zero.headers.get("cache-control", "").lower()
+
+    # Accepting a change invalidates previous export cache immediately
+    patch_res = client.patch(
+        f"/api/v1/applications/{app_row.id}/changes/{ch.id}",
+        json={"status": "accepted"},
+        headers=headers,
+    )
+    assert patch_res.status_code == 200
+    dl_after_patch = client.get(f"/api/v1/applications/{app_row.id}/versions/{ver.id}/download/pdf", headers=headers)
+    assert dl_after_patch.status_code == 404
+
+    # Export with mocked degraded layout (<95%) -> HTTP 422 blocked and download blocked
+    import app.api.applications as apps_mod
+
+    monkeypatch.setattr(
+        apps_mod,
+        "apply_changes_to_pdf_in_place",
+        lambda **kwargs: build_style_cloned_pdf(
+            source_pdf_path=kwargs["source_pdf_path"],
+            output_pdf_path=kwargs["output_pdf_path"],
+            resume_structure=kwargs["resume_structure"],
+            approved_changes=kwargs["approved_changes"],
+        ),
+    )
+    blocked_exp = client.post(f"/api/v1/applications/{app_row.id}/versions/{ver.id}/export", headers=headers)
+    assert blocked_exp.status_code == 422
+    detail = blocked_exp.json()["detail"]
+    assert detail["unchanged_similarity_score"] < 95.0
+    assert compute_export_cache_key([], source_file_type="pdf").startswith(f"{EXPORT_CODE_VERSION}:")
+    dl_blocked = client.get(f"/api/v1/applications/{app_row.id}/versions/{ver.id}/download/pdf", headers=headers)
+    assert dl_blocked.status_code == 409

@@ -12,26 +12,34 @@ from app.models.github import GitHubAnalysis
 from app.models.user import MasterProfile, User
 from app.schemas.github import (
     AnalyzedRepo,
+    BulletEvidenceItem,
     DetectedGitHubSkill,
     GitHubAnalysisResponse,
     RepoEvidenceSignals,
 )
 from app.services.github.scorer import (
     aggregate_github_skills,
-    build_factual_repo_bullets,
+    build_factual_repo_bullets_with_evidence,
     extract_github_username,
     infer_repo_skills,
     parse_dependencies_from_manifest,
     score_repo_evidence,
 )
+from app.services.llm.base import LLMKeyInvalidError, LLMRateLimitError, LLMServiceError
 from app.services.llm.factory import get_llm_client_for_user
 
 GITHUB_API_BASE = "https://api.github.com"
 MANIFEST_FILES = ("requirements.txt", "pyproject.toml", "package.json", "pom.xml", "go.mod")
 
 
+class BulletWithEvidenceDraft(BaseModel):
+    bullet: str
+    evidence_source: str = "README + dependencies"
+
+
 class RepoBulletDraftSchema(BaseModel):
     bullets: list[str] = Field(default_factory=list)
+    items: list[BulletWithEvidenceDraft] = Field(default_factory=list)
 
 
 class GitHubClient:
@@ -108,6 +116,7 @@ class GitHubClient:
 
         # Tree (bounded file structure inspection)
         key_files: list[str] = []
+        test_files: list[str] = []
         has_tests = False
         has_ci = False
         has_dockerfile = False
@@ -121,11 +130,20 @@ class GitHubClient:
                 blobs = [item["path"] for item in tree_items if item.get("type") == "blob"]
                 file_count = len(blobs)
                 key_files = blobs[:30]
+                test_files = [
+                    p
+                    for p in blobs
+                    if (
+                        "test" in p.lower()
+                        or p.lower().startswith("tests/")
+                        or "__tests__" in p.lower()
+                        or ".spec." in p.lower()
+                    )
+                    and "__pycache__" not in p.lower()
+                    and "node_modules" not in p.lower()
+                ][:15]
                 lower_paths = [p.lower() for p in blobs]
-                has_tests = any(
-                    "test" in p or p.startswith("tests/") or "__tests__" in p
-                    for p in lower_paths
-                )
+                has_tests = bool(test_files)
                 has_ci = any(p.startswith(".github/workflows/") for p in lower_paths)
                 has_dockerfile = any(
                     p.endswith("dockerfile") or p.endswith("docker-compose.yml")
@@ -157,9 +175,10 @@ class GitHubClient:
                     except Exception:
                         pass
 
-        # Commit counts (author share)
+        # Commit counts (author share) and bounded commit summary lines
         total_commits = 0
         user_commits = 0
+        commit_messages: list[str] = []
         commits_resp = self._get(client, f"/repos/{full_name}/commits?per_page=30")
         if commits_resp.status_code == 200 and isinstance(commits_resp.json(), list):
             commits = commits_resp.json()
@@ -168,6 +187,9 @@ class GitHubClient:
                 author = (c.get("author") or {}).get("login", "")
                 if author.lower() == username.lower():
                     user_commits += 1
+                msg = ((c.get("commit") or {}).get("message") or "").splitlines()[0].strip()
+                if msg and len(commit_messages) < 10:
+                    commit_messages.append(msg[:120])
             if user_commits == 0 and not is_fork:
                 # Owner commits authored under local git email not linked to login
                 user_commits = total_commits
@@ -207,6 +229,8 @@ class GitHubClient:
             dependencies=list(dict.fromkeys(dependencies))[:30],
             inferred_skills=inferred,
             key_files=key_files[:20],
+            test_files=test_files[:15],
+            commit_messages=commit_messages[:10],
             readme_excerpt=readme_text[:2000],
             stars=int(raw.get("stargazers_count", 0)),
             pushed_at=raw.get("pushed_at"),
@@ -324,25 +348,63 @@ def analyze_github_profile(
     )
 
 
-def generate_repo_bullets(
-    repo: AnalyzedRepo, *, db: Session, user: User
-) -> list[str]:
-    """Generate 2-3 honest resume bullets strictly from bounded repo content."""
-    fallback = build_factual_repo_bullets(repo)
+_BANNED_META_BULLET_PHRASES = (
+    "source files",
+    "core module behavior",
+    "across 1",
+    "across 2",
+    "across 3",
+    "across 4",
+    "across 5",
+    "across 6",
+    "across 7",
+    "across 8",
+    "across 9",
+)
+
+
+def _is_generic_metadata_bullet(text: str) -> bool:
+    low = text.lower()
+    return any(p in low for p in _BANNED_META_BULLET_PHRASES)
+
+
+def generate_repo_bullets_with_evidence(
+    repo: AnalyzedRepo,
+    *,
+    db: Session,
+    user: User,
+    raise_on_llm_error: bool = False,
+) -> tuple[list[str], list[BulletEvidenceItem]]:
+    """
+    Generate 2-3 strong, honest resume bullets strictly from repo README, code/dependencies,
+    commit messages, and real test files, returning per-bullet evidence sources.
+    """
+    fallback_bullets, fallback_evidence = build_factual_repo_bullets_with_evidence(repo)
     try:
         llm = get_llm_client_for_user(db, user)
     except Exception:
-        return fallback
+        if raise_on_llm_error:
+            raise
+        return fallback_bullets, fallback_evidence
 
+    test_files_hint = ", ".join(repo.test_files[:6]) if repo.test_files else "None"
+    commit_hint = "; ".join(repo.commit_messages[:5]) if repo.commit_messages else "None"
     prompt = (
-        "Write 2 concise, strong resume bullet points for this GitHub project using ONLY the provided facts. "
-        "Do NOT invent any metrics, user counts, latency numbers, or tools not listed below.\n\n"
+        "Write 2 concise, resume-ready bullet points describing what this project does and the candidate's engineering contribution.\n"
+        "STRICT RULES:\n"
+        "1. Use ONLY facts directly supported by the README, dependencies, key files, commit messages, and test files below.\n"
+        "2. Do NOT mention repository file counts (never write 'across N files'), bare language lists, or invented metrics/user counts.\n"
+        "3. Never write generic filler like 'Added automated test coverage to verify core module behavior.'\n"
+        "4. Only mention tests if Test files != None, and name specifically what modules/features the test files cover.\n"
+        "5. Populate `items` with `{bullet, evidence_source}` citing the concrete evidence (e.g. 'README + package.json', 'Commit history', 'tests/test_slides.py').\n\n"
         f"Project: {repo.name}\n"
         f"Description: {repo.description}\n"
-        f"Inferred skills/dependencies: {', '.join(repo.inferred_skills)}\n"
+        f"Dependencies / key stack: {', '.join(repo.dependencies[:12]) or ', '.join(repo.inferred_skills[:6])}\n"
         f"Key files: {', '.join(repo.key_files[:12])}\n"
-        f"Has tests: {repo.signals.has_tests}, Has CI: {repo.signals.has_ci}, Has Docker: {repo.signals.has_dockerfile}\n"
-        f"README excerpt:\n{repo.readme_excerpt[:1200]}"
+        f"Test files: {test_files_hint}\n"
+        f"Recent commit summaries: {commit_hint}\n"
+        f"Has CI: {repo.signals.has_ci}, Has Docker: {repo.signals.has_dockerfile}\n"
+        f"README excerpt:\n{repo.readme_excerpt[:1400]}"
     )
     try:
         res = llm.generate_structured(
@@ -352,7 +414,60 @@ def generate_repo_bullets(
             tier="fast",
             redact_pii=False,
         )
-        cleaned = [b.strip() for b in res.bullets if b.strip()]
-        return cleaned[:3] if cleaned else fallback
+    except (LLMKeyInvalidError, LLMRateLimitError, LLMServiceError, TimeoutError):
+        if raise_on_llm_error:
+            raise
+        return fallback_bullets, fallback_evidence
     except Exception:
-        return fallback
+        if raise_on_llm_error:
+            raise
+        return fallback_bullets, fallback_evidence
+
+    from app.schemas.resume import ParsedResumeStructure
+    from app.services.generation.validator import validate_claim_against_evidence
+
+    raw_items: list[tuple[str, str]] = []
+    if res.items:
+        for it in res.items:
+            if it.bullet.strip():
+                raw_items.append((it.bullet.strip(), (it.evidence_source or "README + repository code").strip()))
+    else:
+        for b in res.bullets:
+            if b.strip():
+                raw_items.append((b.strip(), f"GitHub repository {repo.full_name}"))
+
+    valid_bullets: list[str] = []
+    valid_evidence: list[BulletEvidenceItem] = []
+    for text, src in raw_items[:3]:
+        if _is_generic_metadata_bullet(text):
+            continue
+        val = validate_claim_against_evidence(
+            new_text=text,
+            original_text="",
+            section="projects",
+            resume=ParsedResumeStructure(),
+            raw_resume_text="",
+            github_repos=[repo],
+        )
+        if val.status == "blocked":
+            continue
+        valid_bullets.append(text)
+        valid_evidence.append(
+            BulletEvidenceItem(
+                bullet=text,
+                source=src,
+                detail=f"{src} ({repo.full_name})",
+            )
+        )
+
+    if valid_bullets:
+        return valid_bullets, valid_evidence
+    return fallback_bullets, fallback_evidence
+
+
+def generate_repo_bullets(
+    repo: AnalyzedRepo, *, db: Session, user: User
+) -> list[str]:
+    """Generate 2-3 honest resume bullets strictly from bounded repo content."""
+    bullets, _ = generate_repo_bullets_with_evidence(repo, db=db, user=user)
+    return bullets

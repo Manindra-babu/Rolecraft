@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.github import RepoRecommendation
 from app.schemas.matching import CompatibilityBreakdown, LearningPlanDetail, SkillAssessmentItem
@@ -25,6 +25,34 @@ class GitHubDecisionItem(BaseModel):
 
 class GitHubDecisionsRequest(BaseModel):
     decisions: list[GitHubDecisionItem]
+
+
+class ConfirmGitHubProjectsRequest(BaseModel):
+    repo_names: list[str] = Field(min_length=1, max_length=25)
+
+    @field_validator("repo_names")
+    @classmethod
+    def validate_repo_names(cls, value: list[str]) -> list[str]:
+        cleaned = [str(v).strip() for v in value if str(v).strip()]
+        deduped = list(dict.fromkeys(cleaned))
+        if not deduped:
+            raise ValueError("Approve at least one repository before confirming.")
+        return deduped
+
+
+class GitHubConfirmJobResponse(BaseModel):
+    job_id: str
+    application_id: str
+    status: str
+    progress_percent: int
+    stage_message: str
+    repo_names: list[str] = Field(default_factory=list)
+    version_id: Optional[str] = None
+    added_count: int = 0
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
 
 
 class ChangeDecisionRequest(BaseModel):
@@ -64,6 +92,7 @@ class ResumeVersionResponse(BaseModel):
     unchanged_similarity_score: Optional[float] = None
     theme_warnings: list[str] = Field(default_factory=list)
     export_blocked: bool = False
+    export_cache_key: Optional[str] = None
     changes: list[ChangeResponse] = Field(default_factory=list)
     created_at: datetime
 

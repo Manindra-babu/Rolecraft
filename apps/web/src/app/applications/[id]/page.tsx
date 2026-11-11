@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -11,6 +11,8 @@ import {
   Edit3,
   ExternalLink,
   GitBranch,
+  Loader2,
+  RotateCcw,
   Sparkles,
   X,
 } from "lucide-react";
@@ -24,6 +26,8 @@ import {
   ApplicationSummary,
   ChangeItem,
   getStoredToken,
+  GitHubConfirmJob,
+  RepoRecommendation,
   ResumeUpload,
   ResumeVersion,
 } from "@/lib/api";
@@ -67,6 +71,19 @@ export default function ApplicationWorkspacePage() {
   const [selectedChangeId, setSelectedChangeId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [githubError, setGithubError] = useState<string | null>(null);
+  const [githubOverrides, setGithubOverrides] = useState<
+    Record<string, RepoRecommendation["decision"]>
+  >({});
+  const [confirmJob, setConfirmJob] = useState<GitHubConfirmJob | null>(null);
+  const [isConfirmingGithub, setIsConfirmingGithub] = useState<boolean>(false);
+  const isMountedRef = useRef<boolean>(true);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [origPreviewUrl, setOrigPreviewUrl] = useState<string | null>(null);
   const [notesDraft, setNotesDraft] = useState<string>("");
@@ -121,24 +138,29 @@ export default function ApplicationWorkspacePage() {
       }
       const token = getStoredToken();
       const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {};
-      if (latestVersion.has_preview) {
+      const cacheBuster = encodeURIComponent(
+        latestVersion.export_cache_key || String(latestVersion.similarity_score ?? "0")
+      );
+      if (latestVersion.has_preview && !latestVersion.export_blocked) {
         const resp = await fetch(
-          `${API_BASE}/applications/${appId}/versions/${latestVersion.id}/download/preview`,
-          { headers }
+          `${API_BASE}/applications/${appId}/versions/${latestVersion.id}/download/preview?k=${cacheBuster}`,
+          { headers, cache: "no-store" }
         );
         if (resp.ok && active) {
           const blob = await resp.blob();
           const u = URL.createObjectURL(blob);
           urls.push(u);
           setPreviewUrl(u);
+        } else if (active) {
+          setPreviewUrl(null);
         }
       } else {
         setPreviewUrl(null);
       }
       if (latestVersion.has_orig_preview) {
         const origResp = await fetch(
-          `${API_BASE}/applications/${appId}/versions/${latestVersion.id}/download/orig_preview`,
-          { headers }
+          `${API_BASE}/applications/${appId}/versions/${latestVersion.id}/download/orig_preview?k=${cacheBuster}`,
+          { headers, cache: "no-store" }
         );
         if (origResp.ok && active) {
           const blob = await origResp.blob();
@@ -155,10 +177,21 @@ export default function ApplicationWorkspacePage() {
       active = false;
       urls.forEach((u) => URL.revokeObjectURL(u));
     };
-  }, [appId, latestVersion?.id, latestVersion?.has_preview, latestVersion?.has_orig_preview]);
+  }, [
+    appId,
+    latestVersion?.id,
+    latestVersion?.has_preview,
+    latestVersion?.has_orig_preview,
+    latestVersion?.export_cache_key,
+    latestVersion?.export_blocked,
+    latestVersion?.similarity_score,
+  ]);
 
   const invalidateApp = useCallback(async () => {
-    await queryClient.invalidateQueries({ queryKey: ["application", appId] });
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["application", appId] }),
+      queryClient.invalidateQueries({ queryKey: ["applications"] }),
+    ]);
   }, [queryClient, appId]);
 
   const confirmLearningMutation = useMutation({
@@ -184,14 +217,140 @@ export default function ApplicationWorkspacePage() {
       setActionError(err instanceof ApiError ? err.message : "Could not update learning status."),
   });
 
+  const effectiveGithubRecs = useMemo(() => {
+    return (app?.github_recommendations || []).map((rec) => ({
+      ...rec,
+      decision: githubOverrides[rec.repo_name] ?? rec.decision,
+    }));
+  }, [app?.github_recommendations, githubOverrides]);
+
+  const approvedGithubRepos = useMemo(
+    () => effectiveGithubRecs.filter((r) => r.decision === "approved"),
+    [effectiveGithubRecs]
+  );
+  const rejectedGithubCount = useMemo(
+    () => effectiveGithubRecs.filter((r) => r.decision === "rejected").length,
+    [effectiveGithubRecs]
+  );
+  const pendingGithubCount = useMemo(
+    () => effectiveGithubRecs.filter((r) => r.decision === "pending").length,
+    [effectiveGithubRecs]
+  );
+
   const githubDecisionMutation = useMutation({
-    mutationFn: (item: { repo_name: string; decision: "approved" | "rejected" }) =>
+    mutationFn: (item: {
+      repo_name: string;
+      decision: "approved" | "rejected" | "pending";
+    }) =>
       apiFetch<ApplicationDetail>(`/applications/${appId}/github-decisions`, {
         method: "POST",
         body: JSON.stringify({ decisions: [item] }),
       }),
-    onSuccess: invalidateApp,
+    onMutate: async (item) => {
+      setGithubError(null);
+      const prevOverrides = { ...githubOverrides };
+      setGithubOverrides((cur) => ({ ...cur, [item.repo_name]: item.decision }));
+      return { prevOverrides };
+    },
+    onSuccess: (updatedApp) => {
+      queryClient.setQueryData(["application", appId], updatedApp);
+      setGithubOverrides({});
+    },
+    onError: (err, _vars, ctx) => {
+      if (ctx?.prevOverrides) {
+        setGithubOverrides(ctx.prevOverrides);
+      }
+      setGithubError(
+        err instanceof ApiError
+          ? err.message
+          : "Could not save repository decision. Please try again."
+      );
+    },
   });
+
+  const handleConfirmGithubProjects = async () => {
+    const repoNames = approvedGithubRepos.map((r) => r.repo_name);
+    if (repoNames.length === 0 || isConfirmingGithub) return;
+
+    setGithubError(null);
+    setActionError(null);
+    setIsConfirmingGithub(true);
+    setConfirmJob(null);
+
+    try {
+      let currentJob = await apiFetch<GitHubConfirmJob>(
+        `/applications/${appId}/github-confirm`,
+        {
+          method: "POST",
+          body: JSON.stringify({ repo_names: repoNames }),
+        }
+      );
+      if (!isMountedRef.current) return;
+      setConfirmJob(currentJob);
+
+      const startedAt = Date.now();
+      const timeoutMs = 60_000;
+      while (
+        currentJob.status === "queued" ||
+        currentJob.status === "generating" ||
+        currentJob.status === "validating"
+      ) {
+        if (Date.now() - startedAt > timeoutMs) {
+          throw new ApiError(
+            "Timed out waiting for project generation. Please retry.",
+            504,
+            "TIMEOUT"
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, 450));
+        if (!isMountedRef.current) return;
+        currentJob = await apiFetch<GitHubConfirmJob>(
+          `/applications/${appId}/github-confirm/${currentJob.job_id}`
+        );
+        if (!isMountedRef.current) return;
+        setConfirmJob(currentJob);
+      }
+
+      if (currentJob.status === "failed") {
+        throw new ApiError(
+          currentJob.error_message || "Something went wrong, try again.",
+          500,
+          currentJob.error_code || undefined
+        );
+      }
+
+      await queryClient.invalidateQueries({ queryKey: ["application", appId] });
+      await queryClient.invalidateQueries({ queryKey: ["applications"] });
+      const refreshed = await queryClient.fetchQuery<ApplicationDetail>({
+        queryKey: ["application", appId],
+        queryFn: () => apiFetch<ApplicationDetail>(`/applications/${appId}`),
+      });
+      if (!isMountedRef.current) return;
+
+      const latest = refreshed?.versions?.[0];
+      const firstAdded = latest?.changes?.find(
+        (c) => c.change_type === "added_from_github"
+      );
+      setChangeFilter("all");
+      if (firstAdded) {
+        setSelectedChangeId(firstAdded.id);
+      }
+      setActiveTab("review");
+    } catch (err) {
+      if (!isMountedRef.current) return;
+      const msg =
+        err instanceof ApiError
+          ? err.message
+          : err instanceof Error && err.message
+            ? err.message
+            : "Something went wrong, try again.";
+      setGithubError(msg);
+    } finally {
+      if (isMountedRef.current) {
+        setIsConfirmingGithub(false);
+      }
+    }
+  };
 
   const generateMutation = useMutation({
     mutationFn: () =>
@@ -241,11 +400,21 @@ export default function ApplicationWorkspacePage() {
   });
 
   const exportMutation = useMutation({
-    mutationFn: (versionId: string) =>
-      apiFetch<ResumeVersion>(`/applications/${appId}/versions/${versionId}/export`, {
-        method: "POST",
-      }),
+    mutationFn: ({
+      versionId,
+      tightenSpacing = true,
+    }: {
+      versionId: string;
+      tightenSpacing?: boolean;
+    }) =>
+      apiFetch<ResumeVersion>(
+        `/applications/${appId}/versions/${versionId}/export?tighten_spacing=${tightenSpacing ? "true" : "false"}`,
+        {
+          method: "POST",
+        }
+      ),
     onSuccess: invalidateApp,
+    onError: invalidateApp,
   });
 
   const statusMutation = useMutation({
@@ -333,8 +502,20 @@ export default function ApplicationWorkspacePage() {
       rewordMap.set(ch.original_text, ch.edited_text || ch.new_text);
     }
   }
-  const reorderedSkills = acceptedChanges.find(
-    (c) => c.change_type === "reordered" && c.section === "skills"
+  const reorderedSkillMap = new Map<string, string>();
+  for (const ch of acceptedChanges) {
+    if (ch.change_type === "reordered" && ch.section === "skills") {
+      const val = ch.edited_text || ch.new_text;
+      const idx = val.indexOf(":");
+      if (idx > 0) {
+        reorderedSkillMap.set(val.slice(0, idx).trim().toLowerCase(), val.slice(idx + 1).trim());
+      } else {
+        reorderedSkillMap.set("_flat", val);
+      }
+    }
+  }
+  const summaryOverride = acceptedChanges.find(
+    (c) => c.section === "summary" && c.change_type === "reworded"
   );
   const addedProjects = acceptedChanges.filter((c) => c.change_type === "added_from_github");
   const learningEntries = acceptedChanges.filter((c) => c.change_type === "user_confirmed_skill");
@@ -538,6 +719,25 @@ export default function ApplicationWorkspacePage() {
 
       {activeTab === "github" && (
         <div className="space-y-4">
+          {githubError && (
+            <Alert tone="danger" title="Could not apply GitHub projects">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <span>{githubError}</span>
+                {approvedGithubRepos.length > 0 && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => void handleConfirmGithubProjects()}
+                    disabled={isConfirmingGithub}
+                  >
+                    <RotateCcw className="h-3.5 w-3.5" />
+                    Retry
+                  </Button>
+                )}
+              </div>
+            </Alert>
+          )}
+
           {app.github_recommendations.length === 0 ? (
             <Card className="py-10 text-center text-sm text-ink-muted">
               No GitHub repositories were linked or qualified for recommendation
@@ -545,73 +745,173 @@ export default function ApplicationWorkspacePage() {
               changes using your resume evidence.
             </Card>
           ) : (
-            app.github_recommendations.map((rec) => (
-              <Card key={rec.repo_name} className="space-y-3">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div className="space-y-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <GitBranch className="h-4 w-4 text-accent" aria-hidden="true" />
-                      <a
-                        href={rec.html_url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex items-center gap-1 text-base font-semibold text-ink hover:underline"
-                      >
-                        {rec.full_name}
-                        <ExternalLink className="h-3.5 w-3.5" />
-                      </a>
-                      <Badge tone="accent">
-                        Relevance {rec.relevance_score}%
-                      </Badge>
-                      <Badge tone="neutral">
-                        Evidence Quality {rec.quality_score}/100
-                      </Badge>
-                      {rec.already_in_resume && (
-                        <Badge tone="success">Already on resume</Badge>
-                      )}
-                    </div>
-                    <p className="text-sm text-ink-muted">{rec.reason}</p>
+            <>
+              <Card className="flex flex-col justify-between gap-3 border-accent/20 bg-surface p-4 sm:flex-row sm:items-center">
+                <div className="space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-semibold text-ink">
+                      {approvedGithubRepos.length} approved,{" "}
+                      {rejectedGithubCount} rejected
+                    </span>
+                    {pendingGithubCount > 0 && (
+                      <Badge tone="neutral">{pendingGithubCount} pending</Badge>
+                    )}
                   </div>
-
-                  <div className="flex items-center gap-2">
-                    <Button
-                      size="sm"
-                      variant={rec.decision === "approved" ? "primary" : "secondary"}
-                      onClick={() =>
-                        githubDecisionMutation.mutate({
-                          repo_name: rec.repo_name,
-                          decision: "approved",
-                        })
-                      }
-                    >
-                      <Check className="h-4 w-4" />
-                      Approve
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant={rec.decision === "rejected" ? "danger" : "ghost"}
-                      onClick={() =>
-                        githubDecisionMutation.mutate({
-                          repo_name: rec.repo_name,
-                          decision: "rejected",
-                        })
-                      }
-                    >
-                      <X className="h-4 w-4" />
-                      Reject
-                    </Button>
-                  </div>
+                  <p className="text-xs text-ink-muted">
+                    {approvedGithubRepos.length === 0
+                      ? "Approve at least one repository to add projects to your resume."
+                      : "Confirmed projects will be validated and added as pending changes in Review Changes."}
+                  </p>
                 </div>
 
-                {rec.draft_bullets.length > 0 && (
-                  <ul className="list-disc space-y-1 rounded-md border border-border bg-canvas p-3 pl-7 text-xs text-ink-muted">
-                    {rec.draft_bullets.map((b, i) => (
-                      <li key={i}>{b}</li>
-                    ))}
-                  </ul>
-                )}
+                <div className="flex flex-col items-start gap-2 sm:items-end">
+                  <Button
+                    onClick={() => void handleConfirmGithubProjects()}
+                    disabled={
+                      approvedGithubRepos.length === 0 || isConfirmingGithub
+                    }
+                  >
+                    {isConfirmingGithub && (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    )}
+                    {isConfirmingGithub ? "Adding projects..." : "Confirm"}
+                  </Button>
+                </div>
               </Card>
-            ))
+
+              {isConfirmingGithub && confirmJob && (
+                <Card className="space-y-2 border-accent/30 bg-accent-soft/25 p-4">
+                  <div className="flex items-center justify-between text-xs font-medium text-ink">
+                    <span>
+                      {confirmJob.stage_message || "Adding GitHub projects..."}
+                    </span>
+                    <Badge tone="accent">{confirmJob.status}</Badge>
+                  </div>
+                  <div className="h-2 w-full overflow-hidden rounded-full bg-border">
+                    <div
+                      className="h-full bg-accent transition-all duration-300"
+                      style={{
+                        width: `${Math.min(100, Math.max(10, confirmJob.progress_percent))}%`,
+                      }}
+                    />
+                  </div>
+                </Card>
+              )}
+
+              {effectiveGithubRecs.map((rec) => {
+                const isApproved = rec.decision === "approved";
+                const isRejected = rec.decision === "rejected";
+                return (
+                  <Card
+                    key={rec.repo_name}
+                    data-decision={rec.decision}
+                    className={`space-y-3 transition-colors ${
+                      isApproved
+                        ? "border-accent/50 bg-accent-soft/10"
+                        : isRejected
+                          ? "border-border bg-subtle opacity-60"
+                          : ""
+                    }`}
+                  >
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="space-y-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <GitBranch
+                            className="h-4 w-4 text-accent"
+                            aria-hidden="true"
+                          />
+                          <a
+                            href={rec.html_url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className={`inline-flex items-center gap-1 text-base font-semibold hover:underline ${
+                              isRejected
+                                ? "text-ink-muted line-through"
+                                : "text-ink"
+                            }`}
+                          >
+                            {rec.full_name}
+                            <ExternalLink className="h-3.5 w-3.5" />
+                          </a>
+                          <Badge tone="accent">
+                            Relevance {rec.relevance_score}%
+                          </Badge>
+                          <Badge tone="neutral">
+                            Evidence Quality {rec.quality_score}/100
+                          </Badge>
+                          {rec.already_in_resume && (
+                            <Badge tone="success">Already on resume</Badge>
+                          )}
+                          {isApproved && (
+                            <Badge tone="success">Approved for resume</Badge>
+                          )}
+                          {isRejected && <Badge tone="neutral">Rejected</Badge>}
+                        </div>
+                        <p
+                          className={`text-sm text-ink-muted ${
+                            isRejected ? "line-through" : ""
+                          }`}
+                        >
+                          {rec.reason}
+                        </p>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <Button
+                          size="sm"
+                          variant={isApproved ? "primary" : "secondary"}
+                          aria-pressed={isApproved}
+                          disabled={isConfirmingGithub}
+                          onClick={() =>
+                            githubDecisionMutation.mutate({
+                              repo_name: rec.repo_name,
+                              decision: isApproved ? "pending" : "approved",
+                            })
+                          }
+                        >
+                          <Check className="h-4 w-4" />
+                          {isApproved ? "Approved" : "Approve"}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant={isRejected ? "danger" : "ghost"}
+                          aria-pressed={isRejected}
+                          disabled={isConfirmingGithub}
+                          className={isRejected ? "line-through" : ""}
+                          onClick={() =>
+                            githubDecisionMutation.mutate({
+                              repo_name: rec.repo_name,
+                              decision: isRejected ? "pending" : "rejected",
+                            })
+                          }
+                        >
+                          <X className="h-4 w-4" />
+                          {isRejected ? "Rejected" : "Reject"}
+                        </Button>
+                      </div>
+                    </div>
+
+                    {rec.draft_bullets.length > 0 && (
+                      <ul className="list-disc space-y-2 rounded-md border border-border bg-canvas p-3 pl-7 text-xs text-ink-muted">
+                        {rec.draft_bullets.map((b, i) => {
+                          const ev = rec.bullet_evidence?.[i];
+                          return (
+                            <li key={i} className="space-y-0.5">
+                              <span className="text-ink">{b}</span>
+                              {ev && (
+                                <p className="text-[11px] text-ink-muted">
+                                  Evidence: {ev.source} — {ev.detail}
+                                </p>
+                              )}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    )}
+                  </Card>
+                );
+              })}
+            </>
           )}
         </div>
       )}
@@ -705,19 +1005,24 @@ export default function ApplicationWorkspacePage() {
                               <span className="font-semibold uppercase tracking-wide text-ink">
                                 {ch.section}
                               </span>
-                              <Badge
-                                tone={
-                                  ch.validation_status === "blocked"
-                                    ? "danger"
-                                    : ch.status === "accepted" || ch.status === "edited"
-                                      ? "success"
-                                      : ch.status === "rejected"
-                                        ? "neutral"
-                                        : "warning"
-                                }
-                              >
-                                {ch.validation_status === "blocked" ? "blocked" : ch.status}
-                              </Badge>
+                              <div className="flex items-center gap-1">
+                                {ch.change_type === "added_from_github" && (
+                                  <Badge tone="accent">Added from GitHub</Badge>
+                                )}
+                                <Badge
+                                  tone={
+                                    ch.validation_status === "blocked"
+                                      ? "danger"
+                                      : ch.status === "accepted" || ch.status === "edited"
+                                        ? "success"
+                                        : ch.status === "rejected"
+                                          ? "neutral"
+                                          : "warning"
+                                  }
+                                >
+                                  {ch.validation_status === "blocked" ? "blocked" : ch.status}
+                                </Badge>
+                              </div>
                             </div>
                             <p className="mt-1 line-clamp-2 text-ink-muted">
                               {ch.edited_text || ch.new_text}
@@ -917,6 +1222,14 @@ export default function ApplicationWorkspacePage() {
                           </p>
                         </div>
 
+                        {resume.parsed_structure.summary && (
+                          <p className="italic leading-relaxed text-ink">
+                            {summaryOverride
+                              ? summaryOverride.edited_text || summaryOverride.new_text
+                              : resume.parsed_structure.summary}
+                          </p>
+                        )}
+
                         {resume.parsed_structure.experience.length > 0 && (
                           <div className="space-y-1.5">
                             <p className="border-b border-border pb-0.5 font-sans text-[11px] font-semibold uppercase tracking-wider">
@@ -962,18 +1275,43 @@ export default function ApplicationWorkspacePage() {
                           </div>
                         )}
 
-                        {(reorderedSkills ||
+                        {(reorderedSkillMap.size > 0 ||
+                          Object.keys(resume.parsed_structure.skill_categories || {}).length > 0 ||
                           resume.parsed_structure.skills.length > 0) && (
                           <div>
                             <p className="border-b border-border pb-0.5 font-sans text-[11px] font-semibold uppercase tracking-wider">
                               Skills
                             </p>
-                            <p className="mt-1">
-                              {reorderedSkills
-                                ? reorderedSkills.edited_text ||
-                                  reorderedSkills.new_text
-                                : resume.parsed_structure.skills.join(", ")}
+                            {Object.keys(resume.parsed_structure.skill_categories || {}).length > 0 ? (
+                              <ul className="mt-1 space-y-0.5">
+                                {Object.entries(resume.parsed_structure.skill_categories || {}).map(
+                                  ([cat, items]) => (
+                                    <li key={cat}>
+                                      <span className="font-semibold">{cat}:</span>{" "}
+                                      {reorderedSkillMap.get(cat.toLowerCase()) || items.join(", ")}
+                                    </li>
+                                  )
+                                )}
+                              </ul>
+                            ) : (
+                              <p className="mt-1">
+                                {reorderedSkillMap.get("_flat") ||
+                                  resume.parsed_structure.skills.join(", ")}
+                              </p>
+                            )}
+                          </div>
+                        )}
+
+                        {resume.parsed_structure.certifications.length > 0 && (
+                          <div>
+                            <p className="border-b border-border pb-0.5 font-sans text-[11px] font-semibold uppercase tracking-wider">
+                              Certifications
                             </p>
+                            <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                              {resume.parsed_structure.certifications.map((cert, ci) => (
+                                <li key={ci}>{cert}</li>
+                              ))}
+                            </ul>
                           </div>
                         )}
 
@@ -1061,7 +1399,7 @@ export default function ApplicationWorkspacePage() {
             {latestVersion ? (
               <div className="space-y-4">
                 <Button
-                  onClick={() => exportMutation.mutate(latestVersion.id)}
+                  onClick={() => exportMutation.mutate({ versionId: latestVersion.id })}
                   disabled={exportMutation.isPending}
                 >
                   {exportMutation.isPending
@@ -1108,12 +1446,34 @@ export default function ApplicationWorkspacePage() {
                   )}
 
                 {latestVersion.overflow_detected && (
-                  <Alert tone="warning" title="Page overflow detected">
+                  <Alert tone="warning" title="One-page constraint: additions exceed 1 page">
                     <ul className="list-disc pl-4 text-xs">
                       {latestVersion.overflow_suggestions.map((s, i) => (
                         <li key={i}>{s}</li>
                       ))}
                     </ul>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        disabled={exportMutation.isPending}
+                        onClick={() =>
+                          exportMutation.mutate({
+                            versionId: latestVersion.id,
+                            tightenSpacing: true,
+                          })
+                        }
+                      >
+                        Tighten section spacing &amp; rebuild
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => setActiveTab("review")}
+                      >
+                        Trim bullets or reject a project
+                      </Button>
+                    </div>
                   </Alert>
                 )}
 

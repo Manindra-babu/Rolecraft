@@ -176,6 +176,12 @@ export interface SkillAssessmentItem {
   confidence: number;
 }
 
+export interface BulletEvidenceItem {
+  bullet: string;
+  source: string;
+  detail: string;
+}
+
 export interface RepoRecommendation {
   repo_name: string;
   full_name: string;
@@ -186,7 +192,23 @@ export interface RepoRecommendation {
   reason: string;
   already_in_resume: boolean;
   draft_bullets: string[];
+  bullet_evidence?: BulletEvidenceItem[];
   decision: "pending" | "approved" | "rejected";
+}
+
+export interface GitHubConfirmJob {
+  job_id: string;
+  application_id: string;
+  status: "queued" | "generating" | "validating" | "done" | "failed";
+  progress_percent: number;
+  stage_message: string;
+  repo_names: string[];
+  version_id: string | null;
+  added_count: number;
+  error_code: string | null;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface LearningPlanDetail {
@@ -245,6 +267,7 @@ export interface ResumeVersion {
   unchanged_similarity_score?: number | null;
   theme_warnings?: string[];
   export_blocked?: boolean;
+  export_cache_key?: string | null;
   changes: ChangeItem[];
   created_at: string;
 }
@@ -289,12 +312,16 @@ export interface ApplicationDetail {
 const TOKEN_STORAGE_KEY = "resumeiq_access_token";
 
 export function getStoredToken(): string | null {
-  if (typeof window === "undefined") return null;
+  if (typeof window === "undefined" || typeof window.localStorage?.getItem !== "function") {
+    return null;
+  }
   return window.localStorage.getItem(TOKEN_STORAGE_KEY);
 }
 
 export function setStoredToken(token: string | null): void {
-  if (typeof window === "undefined") return;
+  if (typeof window === "undefined" || typeof window.localStorage?.setItem !== "function") {
+    return;
+  }
   if (token) {
     window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
   } else {

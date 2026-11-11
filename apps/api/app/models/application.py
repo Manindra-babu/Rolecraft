@@ -73,6 +73,7 @@ class ResumeVersion(Base, TimestampMixin):
     unchanged_similarity_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     theme_warnings: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     export_blocked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    export_cache_key: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 
     application: Mapped["Application"] = relationship(back_populates="versions")
     changes: Mapped[list["Change"]] = relationship(
@@ -132,3 +133,26 @@ class SkillAssessment(Base, TimestampMixin):
     confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
 
     application: Mapped["Application"] = relationship(back_populates="skill_assessments")
+
+
+class GitHubConfirmJob(Base, TimestampMixin):
+    __tablename__ = "github_confirm_jobs"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    application_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("applications.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    repo_names: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    # queued | generating | validating | done | failed
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False)
+    progress_percent: Mapped[int] = mapped_column(Integer, default=10, nullable=False)
+    stage_message: Mapped[str] = mapped_column(String(255), default="Queued...", nullable=False)
+    error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    version_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    added_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

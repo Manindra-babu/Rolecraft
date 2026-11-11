@@ -3,6 +3,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import inspect, text
 
 from app.api import applications, auth, extension, github, health, jobs, learning, privacy, profile, resumes
 from app.core.config import get_settings
@@ -40,9 +41,31 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     def on_startup() -> None:
+        from app.services.resume.pdf_editor import EXPORT_CODE_VERSION
+
         Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
         Path(settings.OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
         Base.metadata.create_all(bind=engine)
+        # Ensure export_cache_key column exists on legacy DBs and purge stale pre-v4 export artifacts
+        try:
+            insp = inspect(engine)
+            cols = {c["name"] for c in insp.get_columns("resume_versions")}
+            with engine.begin() as conn:
+                if "export_cache_key" not in cols:
+                    conn.execute(text("ALTER TABLE resume_versions ADD COLUMN export_cache_key VARCHAR(128)"))
+                conn.execute(
+                    text(
+                        "UPDATE resume_versions "
+                        "SET output_docx_path = NULL, output_pdf_path = NULL, preview_image_path = NULL, "
+                        "    output_docx_bytes = NULL, output_pdf_bytes = NULL, preview_image_bytes = NULL, "
+                        "    similarity_score = NULL, unchanged_similarity_score = NULL, "
+                        "    export_blocked = FALSE, theme_warnings = '[]', export_cache_key = NULL "
+                        "WHERE export_cache_key IS NULL OR export_cache_key NOT LIKE :prefix"
+                    ),
+                    {"prefix": f"{EXPORT_CODE_VERSION}:%"},
+                )
+        except Exception as exc:
+            logger.warning("Startup export cache cleanup skipped: %s", type(exc).__name__)
 
     prefix = settings.API_V1_PREFIX
     app.include_router(health.router, prefix=prefix)
