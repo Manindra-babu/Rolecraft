@@ -570,12 +570,11 @@ def confirm_github_projects(
     settings = get_settings()
     if settings.TASK_RUNNER == "rq" and settings.REDIS_URL:
         enqueue_task(run_github_confirm_job, job_row.id)
-    elif settings.ENVIRONMENT == "test":
-        # Run synchronously inside the test request using the injected db_session fixture
+    else:
+        # Execute inline when no external RQ worker is active (e.g. Vercel serverless freezes
+        # Starlette BackgroundTasks once the HTTP response is flushed).
         run_github_confirm_job(job_row.id, db=db)
         db.refresh(job_row)
-    else:
-        background_tasks.add_task(run_github_confirm_job, job_row.id)
 
     return _to_confirm_job_response(job_row)
 

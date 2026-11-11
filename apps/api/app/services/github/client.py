@@ -374,6 +374,7 @@ def generate_repo_bullets_with_evidence(
     db: Session,
     user: User,
     raise_on_llm_error: bool = False,
+    llm: Any | None = None,
 ) -> tuple[list[str], list[BulletEvidenceItem]]:
     """
     Generate 2-3 strong, honest resume bullets strictly from repo README, code/dependencies,
@@ -381,7 +382,7 @@ def generate_repo_bullets_with_evidence(
     """
     fallback_bullets, fallback_evidence = build_factual_repo_bullets_with_evidence(repo)
     try:
-        llm = get_llm_client_for_user(db, user)
+        llm = llm or get_llm_client_for_user(db, user)
     except Exception:
         if raise_on_llm_error:
             raise

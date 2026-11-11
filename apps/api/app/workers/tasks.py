@@ -152,6 +152,7 @@ def run_github_confirm_job(job_id: str, db: Session | None = None) -> dict[str, 
                         db=session,
                         user=user,
                         raise_on_llm_error=True,
+                        llm=llm,
                     )
                     rec.draft_bullets = bullets
                     rec.bullet_evidence = bullet_evidence
@@ -282,7 +283,17 @@ def run_github_confirm_job(job_id: str, db: Session | None = None) -> dict[str, 
                     session.add(Change(resume_version_id=latest_version.id, **payload_dict))
                 added_count += 1
 
-        # Stage 3: Done
+        # Stage 3: Invalidate stale export cache and mark Done
+        latest_version.export_cache_key = None
+        latest_version.output_pdf_path = None
+        latest_version.output_pdf_bytes = None
+        latest_version.output_docx_path = None
+        latest_version.output_docx_bytes = None
+        latest_version.preview_image_path = None
+        latest_version.preview_image_bytes = None
+        latest_version.export_blocked = False
+        session.add(latest_version)
+
         job_row.status = "done"
         job_row.progress_percent = 100
         job_row.stage_message = f"Added {added_count} GitHub project{'s' if added_count != 1 else ''} to Review Changes."
