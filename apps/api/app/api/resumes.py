@@ -123,6 +123,7 @@ async def upload_resume(
         file_type=file_type,
         file_size=len(content),
         storage_path=str(dest_path),
+        file_bytes=content,
         layout_type=layout_type,
         page_count=page_count,
         parsed_structure=parsed.model_dump(mode="json"),

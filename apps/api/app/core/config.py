@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import List
@@ -58,8 +59,8 @@ class Settings(BaseSettings):
 
     # Storage & CORS
     BACKEND_CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
-    UPLOAD_DIR: str = "./storage/uploads"
-    OUTPUT_DIR: str = "./storage/outputs"
+    UPLOAD_DIR: str = "/tmp/resumeiq/uploads" if os.getenv("VERCEL") else "./storage/uploads"
+    OUTPUT_DIR: str = "/tmp/resumeiq/outputs" if os.getenv("VERCEL") else "./storage/outputs"
     MAX_UPLOAD_MB: int = 10
 
     @property

@@ -1,7 +1,7 @@
 import uuid
 from typing import Any, Optional
 
-from sqlalchemy import JSON, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, ForeignKey, Integer, LargeBinary, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
@@ -20,6 +20,7 @@ class ResumeFile(Base, TimestampMixin):
     file_type: Mapped[str] = mapped_column(String(16), nullable=False)  # docx | pdf
     file_size: Mapped[int] = mapped_column(Integer, nullable=False)
     storage_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    file_bytes: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
     layout_type: Mapped[str] = mapped_column(
         String(64), default="single_column", nullable=False
     )

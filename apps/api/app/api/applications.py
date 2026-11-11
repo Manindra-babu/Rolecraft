@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, require_valid_gemini_key
@@ -47,9 +47,11 @@ def _to_version_response(v: ResumeVersion) -> ResumeVersionResponse:
     return ResumeVersionResponse(
         id=v.id,
         version_number=v.version_number,
-        has_docx=bool(v.output_docx_path and Path(v.output_docx_path).exists()),
-        has_pdf=bool(v.output_pdf_path and Path(v.output_pdf_path).exists()),
-        has_preview=bool(v.preview_image_path and Path(v.preview_image_path).exists()),
+        has_docx=bool(v.output_docx_bytes or (v.output_docx_path and Path(v.output_docx_path).exists())),
+        has_pdf=bool(v.output_pdf_bytes or (v.output_pdf_path and Path(v.output_pdf_path).exists())),
+        has_preview=bool(
+            v.preview_image_bytes or (v.preview_image_path and Path(v.preview_image_path).exists())
+        ),
         page_count_original=v.page_count_original,
         page_count_output=v.page_count_output,
         overflow_detected=v.overflow_detected,
@@ -564,6 +566,9 @@ def export_resume_version(
     out_png = out_dir / "preview_page1.png"
 
     source_path = Path(resume.storage_path)
+    if not source_path.exists() and resume.file_bytes:
+        source_path = out_dir / f"_source.{resume.file_type}"
+        source_path.write_bytes(resume.file_bytes)
     orig_pages = resume.page_count
 
     if resume.file_type == "docx" and source_path.exists():
@@ -600,6 +605,9 @@ def export_resume_version(
     version.output_docx_path = str(out_docx)
     version.output_pdf_path = str(out_pdf)
     version.preview_image_path = str(out_png)
+    version.output_docx_bytes = out_docx.read_bytes() if out_docx.exists() else None
+    version.output_pdf_bytes = out_pdf.read_bytes() if out_pdf.exists() else None
+    version.preview_image_bytes = out_png.read_bytes() if out_png.exists() else None
     version.page_count_original = orig_pages
     version.page_count_output = out_pages
     version.overflow_detected = overflow
@@ -631,21 +639,28 @@ def download_version_artifact(
     if not version:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version not found.")
 
-    if kind == "docx" and version.output_docx_path and Path(version.output_docx_path).exists():
-        return FileResponse(
-            version.output_docx_path,
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            filename="ResumeIQ_Optimized.docx",
-        )
-    if kind == "pdf" and version.output_pdf_path and Path(version.output_pdf_path).exists():
-        return FileResponse(
-            version.output_pdf_path,
-            media_type="application/pdf",
-            filename="ResumeIQ_Optimized.pdf",
-        )
-    if kind == "preview" and version.preview_image_path and Path(version.preview_image_path).exists():
-        return FileResponse(
-            version.preview_image_path,
-            media_type="image/png",
-        )
+    if kind == "docx":
+        mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        if version.output_docx_path and Path(version.output_docx_path).exists():
+            return FileResponse(version.output_docx_path, media_type=mime, filename="ResumeIQ_Optimized.docx")
+        if version.output_docx_bytes:
+            return Response(
+                content=version.output_docx_bytes,
+                media_type=mime,
+                headers={"Content-Disposition": 'attachment; filename="ResumeIQ_Optimized.docx"'},
+            )
+    if kind == "pdf":
+        if version.output_pdf_path and Path(version.output_pdf_path).exists():
+            return FileResponse(version.output_pdf_path, media_type="application/pdf", filename="ResumeIQ_Optimized.pdf")
+        if version.output_pdf_bytes:
+            return Response(
+                content=version.output_pdf_bytes,
+                media_type="application/pdf",
+                headers={"Content-Disposition": 'attachment; filename="ResumeIQ_Optimized.pdf"'},
+            )
+    if kind == "preview":
+        if version.preview_image_path and Path(version.preview_image_path).exists():
+            return FileResponse(version.preview_image_path, media_type="image/png")
+        if version.preview_image_bytes:
+            return Response(content=version.preview_image_bytes, media_type="image/png")
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export artifact not generated yet.")

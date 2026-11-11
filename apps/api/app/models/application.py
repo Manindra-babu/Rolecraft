@@ -1,7 +1,7 @@
 import uuid
 from typing import Any, Optional
 
-from sqlalchemy import JSON, Boolean, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, Float, ForeignKey, Integer, LargeBinary, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
@@ -59,6 +59,9 @@ class ResumeVersion(Base, TimestampMixin):
     output_docx_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     output_pdf_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     preview_image_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    output_docx_bytes: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
+    output_pdf_bytes: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
+    preview_image_bytes: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
     page_count_original: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     page_count_output: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     overflow_detected: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
