@@ -29,6 +29,7 @@ class JobPosting(Base, TimestampMixin):
     responsibilities: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     required_skills: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     preferred_skills: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    or_groups: Mapped[list[list[str]]] = mapped_column(JSON, default=list, nullable=False)
     keywords: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     raw_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
 

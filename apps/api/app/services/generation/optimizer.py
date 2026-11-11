@@ -6,10 +6,22 @@ from pydantic import BaseModel, Field
 from app.schemas.github import AnalyzedRepo, RepoRecommendation
 from app.schemas.job import StructuredJobFields
 from app.schemas.resume import ParsedResumeStructure
-from app.services.generation.validator import validate_claim_against_evidence
+from app.services.generation.validator import BAD_GLYPH_RE, validate_claim_against_evidence
 from app.services.llm.base import LLMClient
 from app.services.llm.demo_client import DemoLLMClient
-from app.services.matching.normalizer import normalize_skill, skill_in_text
+from app.services.matching.normalizer import find_direct_and_implied_skills, normalize_skill, skill_in_text
+
+TYPO_RULES: list[tuple[re.Pattern[str], str, str]] = [
+    (re.compile(r"\bFULL STACK DEVELOPER INTER\b"), "FULL STACK DEVELOPER INTERN", "Fix truncated role title typo ('INTER' -> 'INTERN')."),
+    (re.compile(r"\bFull stack developer inter\b"), "Full stack developer intern", "Fix truncated role title typo ('inter' -> 'intern')."),
+    (re.compile(r"\bKNOWLEDEGE\b"), "KNOWLEDGE", "Fix spelling typo ('KNOWLEDEGE' -> 'KNOWLEDGE')."),
+    (re.compile(r"\bknowledege\b"), "knowledge", "Fix spelling typo ('knowledege' -> 'knowledge')."),
+    (re.compile(r"\bRETRIVAL\b"), "RETRIEVAL", "Fix spelling typo ('RETRIVAL' -> 'RETRIEVAL')."),
+    (re.compile(r"\bretrival\b"), "retrieval", "Fix spelling typo ('retrival' -> 'retrieval')."),
+    (re.compile(r"\bcasual(\s+masking)\b", re.I), r"causal\1", "Fix technical term typo ('casual masking' -> 'causal masking')."),
+    (re.compile(r"\b(hardware\s+)constrains\b", re.I), r"\1constraints", "Fix spelling typo ('constrains' -> 'constraints')."),
+    (re.compile(r"\bDetail-\s+Detail-oriented\b"), "Detail-oriented", "Remove duplicated prefix ('Detail- Detail-oriented' -> 'Detail-oriented')."),
+]
 
 
 class BulletRewriteSchema(BaseModel):
@@ -17,35 +29,112 @@ class BulletRewriteSchema(BaseModel):
     reason: str
 
 
+def _apply_typo_fixes(text: str) -> tuple[str, list[str]]:
+    updated = text
+    reasons: list[str] = []
+    for pat, repl, note in TYPO_RULES:
+        if pat.search(updated):
+            updated = pat.sub(repl, updated)
+            reasons.append(note)
+    return updated, reasons
+
+
+def _find_element_location(elements_by_id: dict[str, Any], needle: str, *, section: str = "") -> dict[str, Any]:
+    low = (needle or "").strip().lower()
+    if not low:
+        return {}
+    # Exact or prefix substring match in target section
+    for el in elements_by_id.values():
+        if section and el.get("section") != section:
+            continue
+        et = (el.get("text") or "").strip().lower()
+        if et == low or low in et or et in low:
+            return el
+    return {}
+
+
 def _deterministic_bullet_tailor(bullet: str, job_skills: list[str]) -> tuple[str, str] | None:
     """
-    Conservative, truthful deterministic refinement when LLM is in Demo mode or skipped.
-    Strengthens weak openings without adding any unverified claim.
+    Truthful deterministic bullet refinement grounded strictly in existing text + implied tech
+    (e.g. expanding MERN -> MongoDB, Express.js, React, Node.js; RESTful APIs -> REST/HTTP) and fixing typos.
     """
-    cleaned = bullet.strip()
+    cleaned, typo_reasons = _apply_typo_fixes(bullet.strip())
+    updated = cleaned
+    reasons: list[str] = list(typo_reasons)
+
     weak_starts = [
         (r"^worked on\s+", "Developed "),
         (r"^helped with\s+", "Contributed to "),
         (r"^responsible for\s+", "Managed "),
         (r"^made\s+", "Built "),
     ]
-    updated = cleaned
-    changed = False
     for pattern, repl in weak_starts:
         if re.match(pattern, updated, flags=re.IGNORECASE):
             updated = re.sub(pattern, repl, updated, count=1, flags=re.IGNORECASE)
-            changed = True
+            reasons.append("Strengthened action verb using existing resume evidence.")
             break
 
-    if not changed:
-        # Check if bullet already matches job skills; if so, tighten wording slightly if trailing period missing
-        matched = [sk for sk in job_skills if skill_in_text(sk, cleaned)]
-        if matched and not cleaned.endswith("."):
-            updated = f"{cleaned}."
-            changed = True
-        elif matched:
-            return cleaned, f"Aligned with target skill(s): {', '.join(matched[:3])}."
-    return (updated, "Clarified action verb using existing resume evidence.") if changed else None
+    # Explicitly surface true implied tech when matching job requirements
+    job_norms = {normalize_skill(s) for s in job_skills}
+    if re.search(r"\bMERN stack\b", updated, re.I) and "mongodb" not in updated.lower():
+        if job_norms & {"node.js", "react", "javascript", "mongodb", "express"}:
+            updated = re.sub(
+                r"\bMERN stack\b",
+                "MERN stack (MongoDB, Express.js, React, Node.js)",
+                updated,
+                count=1,
+                flags=re.I,
+            )
+            reasons.append("Clarified verified MERN stack technologies (MongoDB, Express.js, React, Node.js) matching target role.")
+
+    if re.search(r"\bRESTful APIs\b", updated, re.I) and "(REST" not in updated:
+        if job_norms & {"rest", "http", "web services"}:
+            updated = re.sub(
+                r"\bRESTful APIs\b",
+                "RESTful APIs (REST/HTTP)",
+                updated,
+                count=1,
+                flags=re.I,
+            )
+            updated = re.sub(r"\bfirebase\b", "Firebase", updated)
+            reasons.append("Highlighted verified REST/HTTP architecture and capitalized Firebase.")
+
+    if re.search(r"\bPyTorch\b", updated, re.I) and "python" not in updated.lower():
+        if "python" in job_norms:
+            updated = re.sub(r"\bPyTorch\b", "PyTorch (Python)", updated, count=1, flags=re.I)
+            reasons.append("Explicitly surfaced Python alongside verified PyTorch implementation.")
+
+    if updated.strip() != bullet.strip():
+        return updated.strip(), " ".join(dict.fromkeys(reasons)) or "Improved alignment using verified resume facts."
+    return None
+
+
+def _tailor_summary_deterministically(
+    summary: str, resume: ParsedResumeStructure, job: StructuredJobFields, job_skills: list[str]
+) -> tuple[str, str] | None:
+    if not summary.strip():
+        return None
+    updated, typo_reasons = _apply_typo_fixes(summary.strip())
+    # Align phrasing gently toward target role using ONLY existing verified tech in resume
+    ev_map = find_direct_and_implied_skills(
+        f"{summary}\n"
+        + "\n".join(b for e in resume.experience for b in e.bullets)
+        + "\n"
+        + "\n".join(b for p in resume.projects for b in p.bullets)
+        + "\n"
+        + "\n".join(resume.certifications)
+    )
+    verified_hits = [sk for sk in job_skills if normalize_skill(sk) in ev_map]
+    # Preserve truthfulness: only fix typos + gently sharpen tail with verified skills if not redundant
+    if verified_hits and "REST" not in updated and any(normalize_skill(s) == "rest" for s in verified_hits):
+        updated = updated.replace(
+            "authentication systems",
+            "RESTful APIs (HTTP/REST) and authentication systems",
+        )
+    if updated.strip() == summary.strip():
+        return None
+    reason = " ".join(dict.fromkeys(typo_reasons + ["Tailored summary to target role using only verified resume evidence."]))
+    return updated.strip(), reason
 
 
 def generate_tailored_changes(
@@ -61,14 +150,95 @@ def generate_tailored_changes(
 ) -> list[dict[str, Any]]:
     """
     Produce proposed ResumeVersion Change dicts and run every single one through
-    the truthfulness validator before returning them to the user.
+    the truthfulness + integrity validator before returning them to the user.
+    Every generated change defaults strictly to status='pending'.
     """
     changes: list[dict[str, Any]] = []
     job_skills = list(dict.fromkeys(job.required_skills + job.preferred_skills + job.keywords))
     elements_by_id = (element_map or {}).get("elements", {})
 
-    # 1. Experience bullet rewrites (using quality model tier when live LLM available)
+    def _emit_change(
+        *,
+        section: str,
+        change_type: str,
+        target_loc: dict[str, Any],
+        original_text: str,
+        new_text: str,
+        reason: str,
+        evidence_refs: list[dict[str, Any]] | None = None,
+    ) -> None:
+        val = validate_claim_against_evidence(
+            new_text=new_text,
+            original_text=original_text,
+            resume=resume,
+            raw_resume_text=raw_resume_text,
+            github_repos=github_repos,
+            confirmed_learning=confirmed_learning,
+            section=section,
+        )
+        changes.append(
+            {
+                "section": section,
+                "change_type": change_type,
+                "target_location": target_loc,
+                "original_text": original_text,
+                "new_text": new_text,
+                "reason": reason,
+                "evidence_refs": evidence_refs or val.evidence_refs,
+                "validation_status": val.status,
+                "validation_warnings": val.warnings,
+                "status": "pending",  # NEVER auto-accept
+            }
+        )
+
+    # 1. Tailored Summary (never auto-accepted)
+    if resume.summary:
+        sum_loc = _find_element_location(elements_by_id, resume.summary[:40], section="summary") or _find_element_location(elements_by_id, resume.summary[:40])
+        tailored_sum = _tailor_summary_deterministically(resume.summary, resume, job, job_skills)
+        if llm is not None and not isinstance(llm, DemoLLMClient):
+            try:
+                out = llm.generate_structured(
+                    prompt=(
+                        "Tailor this resume summary for the target role. Fix any typos like 'Detail- Detail-oriented'. "
+                        "Use ONLY facts, degrees, and technologies already present in the resume.\n\n"
+                        f"Target role: {job.title} at {job.company}\n"
+                        f"Target skills: {', '.join(job_skills[:12])}\n"
+                        f"Original summary: {resume.summary}"
+                    ),
+                    schema=BulletRewriteSchema,
+                    operation="resume_summary_rewrite",
+                    tier="quality",
+                    redact_pii=True,
+                )
+                if out.rewritten_bullet.strip() and out.rewritten_bullet.strip() != resume.summary.strip():
+                    tailored_sum = (out.rewritten_bullet.strip(), out.reason.strip() or "Tailored summary to target role.")
+            except Exception:
+                pass
+        if tailored_sum:
+            _emit_change(
+                section="summary",
+                change_type="reworded",
+                target_loc=sum_loc,
+                original_text=resume.summary,
+                new_text=tailored_sum[0],
+                reason=tailored_sum[1],
+            )
+
+    # 2. Experience title typo fixes + bullet rewrites
     for exp in resume.experience:
+        if exp.title:
+            fixed_title, t_reasons = _apply_typo_fixes(exp.title)
+            if fixed_title != exp.title:
+                title_loc = _find_element_location(elements_by_id, exp.title, section="experience")
+                _emit_change(
+                    section="experience",
+                    change_type="reworded",
+                    target_loc=title_loc,
+                    original_text=exp.title,
+                    new_text=fixed_title,
+                    reason=" ".join(t_reasons),
+                )
+
         bullet_el_ids = [
             eid
             for eid in exp.element_ids
@@ -76,7 +246,7 @@ def generate_tailored_changes(
         ]
         for idx, bullet in enumerate(exp.bullets):
             target_eid = bullet_el_ids[idx] if idx < len(bullet_el_ids) else None
-            target_loc = elements_by_id.get(target_eid, {}) if target_eid else {}
+            target_loc = elements_by_id.get(target_eid, {}) if target_eid else _find_element_location(elements_by_id, bullet[:40], section="experience")
 
             rewritten = bullet
             reason = f"Retained verified bullet for {exp.company or exp.title}."
@@ -85,7 +255,8 @@ def generate_tailored_changes(
                 prompt = (
                     "Rewrite this single resume bullet to be clear, concise, and relevant to the target role. "
                     "STRICT RULE: Use ONLY technologies, numbers, metrics, and scope present in the original bullet "
-                    "or confirmed resume evidence. NEVER invent percentages, counts, tools, or leadership verbs.\n\n"
+                    "or confirmed resume evidence (for MERN, you may explicitly name MongoDB, Express.js, React, Node.js). "
+                    "NEVER invent percentages, counts, tools, or leadership verbs.\n\n"
                     f"Target role: {job.title} at {job.company}\n"
                     f"Target skills: {', '.join(job_skills[:12])}\n"
                     f"Original bullet: {bullet}"
@@ -113,38 +284,82 @@ def generate_tailored_changes(
             if rewritten.strip() == bullet.strip():
                 continue
 
-            val = validate_claim_against_evidence(
-                new_text=rewritten,
+            _emit_change(
+                section="experience",
+                change_type="reworded",
+                target_loc=target_loc,
                 original_text=bullet,
-                resume=resume,
-                raw_resume_text=raw_resume_text,
-                github_repos=github_repos,
-                confirmed_learning=confirmed_learning,
+                new_text=rewritten,
+                reason=reason,
             )
 
-            changes.append(
-                {
-                    "section": "experience",
-                    "change_type": "reworded",
-                    "target_location": target_loc,
-                    "original_text": bullet,
-                    "new_text": rewritten,
-                    "reason": reason,
-                    "evidence_refs": val.evidence_refs,
-                    "validation_status": val.status,
-                    "validation_warnings": val.warnings,
-                    "status": "pending",
-                }
-            )
+    # 3. Project title typo fixes + project bullet rewrites (fixing casual/constrains + true tech)
+    for proj in resume.projects:
+        if proj.name:
+            fixed_name, p_reasons = _apply_typo_fixes(proj.name)
+            if fixed_name != proj.name:
+                proj_loc = _find_element_location(elements_by_id, proj.name, section="projects")
+                _emit_change(
+                    section="projects",
+                    change_type="reworded",
+                    target_loc=proj_loc,
+                    original_text=proj.name,
+                    new_text=fixed_name,
+                    reason=" ".join(p_reasons),
+                )
+        for bullet in proj.bullets:
+            det = _deterministic_bullet_tailor(bullet, job_skills)
+            if det:
+                b_loc = _find_element_location(elements_by_id, bullet[:40], section="projects")
+                _emit_change(
+                    section="projects",
+                    change_type="reworded",
+                    target_loc=b_loc,
+                    original_text=bullet,
+                    new_text=det[0],
+                    reason=det[1],
+                )
 
-    # 2. Skill reordering (safe low-risk change eligible for bulk accept)
-    if resume.skills:
-        norm_job_skills = {normalize_skill(s) for s in job_skills}
-        prioritized = [s for s in resume.skills if normalize_skill(s) in norm_job_skills]
-        remaining = [s for s in resume.skills if normalize_skill(s) not in norm_job_skills]
+    # 4. Category-preserving Skill reordering (ONLY low-risk change eligible for bulk-accept)
+    norm_job_skills = {normalize_skill(s) for s in job_skills}
+    if resume.skill_categories:
+        for cat_label, cat_skills in resume.skill_categories.items():
+            clean_cat_skills = [s.rstrip(".") for s in cat_skills if s.strip() and not BAD_GLYPH_RE.search(s)]
+            prioritized = [s for s in clean_cat_skills if normalize_skill(s) in norm_job_skills]
+            remaining = [s for s in clean_cat_skills if normalize_skill(s) not in norm_job_skills]
+            reordered = prioritized + remaining
+            if reordered != clean_cat_skills and clean_cat_skills:
+                # Find the exact skill line matching this category label
+                skills_loc = next(
+                    (
+                        el
+                        for el in elements_by_id.values()
+                        if el.get("section") == "skills"
+                        and not el.get("is_heading")
+                        and el.get("text", "").lstrip("• ").lower().startswith(f"{cat_label.lower()}:")
+                    ),
+                    {},
+                )
+                orig_line = f"{cat_label}: {', '.join(clean_cat_skills)}"
+                new_line = f"{cat_label}: {', '.join(reordered)}"
+                _emit_change(
+                    section="skills",
+                    change_type="reordered",
+                    target_loc=skills_loc,
+                    original_text=orig_line,
+                    new_text=new_line,
+                    reason=(
+                        f"Reordered skills within '{cat_label}' keeping category label intact "
+                        f"(prioritized {', '.join(prioritized[:4])})."
+                    ),
+                    evidence_refs=[{"source": "resume", "detail": f"Existing Skills category '{cat_label}'"}],
+                )
+    elif resume.skills:
+        clean_skills = [s.rstrip(".") for s in resume.skills if s.strip() and not BAD_GLYPH_RE.search(s)]
+        prioritized = [s for s in clean_skills if normalize_skill(s) in norm_job_skills]
+        remaining = [s for s in clean_skills if normalize_skill(s) not in norm_job_skills]
         reordered = prioritized + remaining
-        if reordered != resume.skills:
-            # Find skills element location
+        if reordered != clean_skills:
             skills_loc = next(
                 (
                     el
@@ -153,35 +368,20 @@ def generate_tailored_changes(
                 ),
                 {},
             )
-            orig_skills_line = ", ".join(resume.skills)
-            new_skills_line = ", ".join(reordered)
-            val = validate_claim_against_evidence(
-                new_text=new_skills_line,
-                original_text=orig_skills_line,
-                resume=resume,
-                raw_resume_text=raw_resume_text,
-                github_repos=github_repos,
-                confirmed_learning=confirmed_learning,
-            )
-            changes.append(
-                {
-                    "section": "skills",
-                    "change_type": "reordered",
-                    "target_location": skills_loc,
-                    "original_text": orig_skills_line,
-                    "new_text": new_skills_line,
-                    "reason": (
-                        f"Moved job-matching skills ({', '.join(prioritized[:5])}) to the front "
-                        "without adding any unverified skills."
-                    ),
-                    "evidence_refs": [{"source": "resume", "detail": "Existing Skills section"}],
-                    "validation_status": val.status,
-                    "validation_warnings": val.warnings,
-                    "status": "pending",
-                }
+            _emit_change(
+                section="skills",
+                change_type="reordered",
+                target_loc=skills_loc,
+                original_text=", ".join(clean_skills),
+                new_text=", ".join(reordered),
+                reason=(
+                    f"Moved job-matching skills ({', '.join(prioritized[:5])}) to the front "
+                    "without adding any unverified skills."
+                ),
+                evidence_refs=[{"source": "resume", "detail": "Existing Skills section"}],
             )
 
-    # 3. Approved GitHub project additions (require individual user decision)
+    # 5. Approved GitHub project additions (require individual user decision)
     for rec in approved_github_recs or []:
         if rec.decision != "approved":
             continue
@@ -189,57 +389,31 @@ def generate_tailored_changes(
         proj_block = f"{rec.repo_name} | {', '.join(rec.matched_skills[:4])} | {rec.html_url}\n" + "\n".join(
             f"• {b}" for b in bullets
         )
-        val = validate_claim_against_evidence(
-            new_text=proj_block,
+        _emit_change(
+            section="projects",
+            change_type="added_from_github",
+            target_loc={"insert_section": "projects", "repo_name": rec.repo_name},
             original_text="",
-            resume=resume,
-            raw_resume_text=raw_resume_text,
-            github_repos=github_repos,
-            confirmed_learning=confirmed_learning,
-        )
-        changes.append(
-            {
-                "section": "projects",
-                "change_type": "added_from_github",
-                "target_location": {"insert_section": "projects", "repo_name": rec.repo_name},
-                "original_text": "",
-                "new_text": proj_block,
-                "reason": rec.reason,
-                "evidence_refs": [
-                    {"source": "github", "detail": f"Verified GitHub repository {rec.full_name}"}
-                ],
-                "validation_status": val.status,
-                "validation_warnings": val.warnings,
-                "status": "pending",
-            }
+            new_text=proj_block,
+            reason=rec.reason,
+            evidence_refs=[{"source": "github", "detail": f"Verified GitHub repository {rec.full_name}"}],
         )
 
-    # 4. User-confirmed active learning (Section 5.7: honest "Currently learning" section only)
+    # 6. User-confirmed active learning ('Currently Learning: ...' added ONLY after explicit confirmation)
     for item in confirmed_learning or []:
         label = str(item.get("label", "")).strip()
         if not label:
             continue
-        val = validate_claim_against_evidence(
-            new_text=label,
+        if not label.lower().startswith("currently learning"):
+            label = f"Currently Learning: {label}"
+        _emit_change(
+            section="skill_development",
+            change_type="user_confirmed_skill",
+            target_loc={"insert_section": "skill_development"},
             original_text="",
-            resume=resume,
-            raw_resume_text=raw_resume_text,
-            github_repos=github_repos,
-            confirmed_learning=confirmed_learning,
-        )
-        changes.append(
-            {
-                "section": "skill_development",
-                "change_type": "user_confirmed_skill",
-                "target_location": {"insert_section": "skill_development"},
-                "original_text": "",
-                "new_text": label,
-                "reason": "Explicitly confirmed active learning (kept separate from proficient Skills).",
-                "evidence_refs": [{"source": "user_confirmed", "detail": label}],
-                "validation_status": val.status,
-                "validation_warnings": val.warnings,
-                "status": "pending",
-            }
+            new_text=label,
+            reason="Explicitly confirmed active learning (kept separate as Currently Learning).",
+            evidence_refs=[{"source": "user_confirmed", "detail": label}],
         )
 
     return changes

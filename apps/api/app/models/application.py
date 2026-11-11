@@ -25,6 +25,7 @@ class Application(Base, TimestampMixin):
     github_analysis_id: Mapped[Optional[str]] = mapped_column(
         String(36), ForeignKey("github_analyses.id", ondelete="SET NULL"), nullable=True
     )
+    github_status: Mapped[str] = mapped_column(String(200), default="not_provided", nullable=False)
 
     # Draft | Applied | Interview | Offer | Rejected
     status: Mapped[str] = mapped_column(String(32), default="Draft", nullable=False)
@@ -62,10 +63,16 @@ class ResumeVersion(Base, TimestampMixin):
     output_docx_bytes: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
     output_pdf_bytes: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
     preview_image_bytes: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
+    orig_preview_image_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    orig_preview_image_bytes: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
     page_count_original: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     page_count_output: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     overflow_detected: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     overflow_suggestions: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    similarity_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    unchanged_similarity_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    theme_warnings: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    export_blocked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     application: Mapped["Application"] = relationship(back_populates="versions")
     changes: Mapped[list["Change"]] = relationship(

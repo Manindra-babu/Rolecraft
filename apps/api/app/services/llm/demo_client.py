@@ -66,8 +66,11 @@ class DemoLLMClient(LLMClient):
             "location": "",
             "experience_level": "",
             "responsibilities": [],
+            "responsibilities_or_soft_requirements": [],
             "required_skills": [],
             "preferred_skills": [],
+            "skills": [],
+            "or_groups": [],
             "keywords": [],
         }
 

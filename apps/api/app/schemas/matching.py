@@ -27,6 +27,8 @@ class SkillAssessmentItem(BaseModel):
     importance: str = "required"  # required | preferred
     evidence_summary: str
     confidence: float
+    or_group: Optional[str] = None
+    or_group_satisfied: bool = False
 
 
 class LearningResource(BaseModel):

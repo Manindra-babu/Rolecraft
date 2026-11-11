@@ -55,10 +55,15 @@ class ResumeVersionResponse(BaseModel):
     has_docx: bool = False
     has_pdf: bool = False
     has_preview: bool = False
+    has_orig_preview: bool = False
     page_count_original: Optional[int] = None
     page_count_output: Optional[int] = None
     overflow_detected: bool = False
     overflow_suggestions: list[str] = Field(default_factory=list)
+    similarity_score: Optional[float] = None
+    unchanged_similarity_score: Optional[float] = None
+    theme_warnings: list[str] = Field(default_factory=list)
+    export_blocked: bool = False
     changes: list[ChangeResponse] = Field(default_factory=list)
     created_at: datetime
 
@@ -86,6 +91,9 @@ class ApplicationDetailResponse(BaseModel):
     job_title: str = ""
     company: str = ""
     github_analysis_id: Optional[str] = None
+    github_status: str = "not_provided"
+    github_username: Optional[str] = None
+    github_repo_count: int = 0
     compatibility_before: Optional[float] = None
     compatibility_after: Optional[float] = None
     score_breakdown: Optional[CompatibilityBreakdown] = None

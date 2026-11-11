@@ -30,6 +30,7 @@ from app.schemas.matching import CompatibilityBreakdown, LearningPlanDetail, Ski
 from app.schemas.resume import ParsedResumeStructure
 from app.services.generation.optimizer import generate_tailored_changes
 from app.services.generation.validator import validate_claim_against_evidence
+from app.services.github.client import analyze_github_profile
 from app.services.github.scorer import rank_repos_for_job
 from app.services.learning.roadmap import build_learning_plan
 from app.services.llm.factory import get_embedding_client_for_user, get_llm_client_for_user
@@ -39,6 +40,8 @@ from app.services.resume.docx_editor import (
     build_ats_docx_from_structure,
     convert_docx_to_pdf_and_preview,
 )
+from app.services.resume.pdf_editor import apply_changes_to_pdf_in_place
+from app.services.resume.theme_verifier import verify_pdf_theme_match
 
 router = APIRouter(prefix="/applications", tags=["applications"])
 
@@ -52,10 +55,18 @@ def _to_version_response(v: ResumeVersion) -> ResumeVersionResponse:
         has_preview=bool(
             v.preview_image_bytes or (v.preview_image_path and Path(v.preview_image_path).exists())
         ),
+        has_orig_preview=bool(
+            v.orig_preview_image_bytes
+            or (v.orig_preview_image_path and Path(v.orig_preview_image_path).exists())
+        ),
         page_count_original=v.page_count_original,
         page_count_output=v.page_count_output,
         overflow_detected=v.overflow_detected,
         overflow_suggestions=list(v.overflow_suggestions or []),
+        similarity_score=v.similarity_score,
+        unchanged_similarity_score=v.unchanged_similarity_score,
+        theme_warnings=list(v.theme_warnings or []),
+        export_blocked=bool(v.export_blocked),
         changes=[ChangeResponse.model_validate(c) for c in v.changes],
         created_at=v.created_at,
     )
@@ -96,6 +107,11 @@ def _to_detail_response(db: Session, app_row: Application) -> ApplicationDetailR
         else None
     )
     versions = sorted(app_row.versions, key=lambda v: v.version_number, reverse=True)
+    gh = (
+        db.query(GitHubAnalysis).filter(GitHubAnalysis.id == app_row.github_analysis_id).first()
+        if app_row.github_analysis_id
+        else None
+    )
 
     return ApplicationDetailResponse(
         id=app_row.id,
@@ -108,6 +124,9 @@ def _to_detail_response(db: Session, app_row: Application) -> ApplicationDetailR
         job_title=job.title if job else "",
         company=job.company if job else "",
         github_analysis_id=app_row.github_analysis_id,
+        github_status=app_row.github_status or ("analyzed" if gh else "not_provided"),
+        github_username=gh.github_username if gh else None,
+        github_repo_count=len(gh.repos_data or []) if gh else 0,
         compatibility_before=app_row.compatibility_before,
         compatibility_after=app_row.compatibility_after,
         score_breakdown=breakdown,
@@ -186,8 +205,10 @@ def create_application(
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job posting not found.")
 
+    parsed_resume = ParsedResumeStructure.model_validate(resume.parsed_structure)
     gh_analysis = None
     gh_repos: list[AnalyzedRepo] = []
+    github_status = "not_provided"
     if payload.github_analysis_id:
         gh_analysis = (
             db.query(GitHubAnalysis)
@@ -199,8 +220,42 @@ def create_application(
         )
         if gh_analysis:
             gh_repos = [AnalyzedRepo.model_validate(r) for r in gh_analysis.repos_data]
+            github_status = f"analyzed (@{gh_analysis.github_username}, {len(gh_repos)} repos)"
+    else:
+        # Auto-detect GitHub profile/repo URL from resume links, projects, or master profile
+        detected_gh = ""
+        for lnk in parsed_resume.links or []:
+            l_url = lnk.get("url", "") if isinstance(lnk, dict) else getattr(lnk, "url", "")
+            if "github.com/" in (l_url or "").lower():
+                detected_gh = l_url
+                break
+        if not detected_gh:
+            for proj in parsed_resume.projects or []:
+                if "github.com/" in (proj.url or "").lower():
+                    detected_gh = proj.url
+                    break
+        if not detected_gh:
+            prof = db.query(MasterProfile).filter(MasterProfile.user_id == current_user.id).first()
+            if prof and prof.github_url and "github.com/" in prof.github_url.lower():
+                detected_gh = prof.github_url
+        if detected_gh:
+            try:
+                gh_res = analyze_github_profile(detected_gh, db=db, user=current_user)
+                if not gh_res.skipped and gh_res.id:
+                    gh_analysis = (
+                        db.query(GitHubAnalysis)
+                        .filter(GitHubAnalysis.id == gh_res.id)
+                        .first()
+                    )
+                    gh_repos = list(gh_res.repos)
+                    github_status = f"analyzed (@{gh_res.github_username}, {len(gh_repos)} repos)"
+                else:
+                    github_status = "skipped"
+            except Exception as exc:
+                github_status = f"unavailable ({type(exc).__name__})"
+        else:
+            github_status = "no_github_link"
 
-    parsed_resume = ParsedResumeStructure.model_validate(resume.parsed_structure)
     embedder = get_embedding_client_for_user(db, current_user)
     llm = get_llm_client_for_user(db, current_user)
 
@@ -211,6 +266,7 @@ def create_application(
         job_preferred_skills=list(job.preferred_skills),
         job_responsibilities=list(job.responsibilities),
         job_keywords=list(job.keywords),
+        job_or_groups=list(job.or_groups or []),
         github_repos=[],
         embedder=embedder,
     )
@@ -222,6 +278,7 @@ def create_application(
         job_preferred_skills=list(job.preferred_skills),
         job_responsibilities=list(job.responsibilities),
         job_keywords=list(job.keywords),
+        job_or_groups=list(job.or_groups or []),
         github_repos=gh_repos,
         embedder=embedder,
     )
@@ -242,6 +299,7 @@ def create_application(
         resume_file_id=resume.id,
         job_posting_id=job.id,
         github_analysis_id=gh_analysis.id if gh_analysis else None,
+        github_status=github_status,
         status="Draft",
         compatibility_before=breakdown_before.overall_score,
         compatibility_after=breakdown_full.overall_score,
@@ -389,6 +447,7 @@ def generate_resume_version(
         responsibilities=list(job.responsibilities),
         required_skills=list(job.required_skills),
         preferred_skills=list(job.preferred_skills),
+        or_groups=list(job.or_groups or []),
         keywords=list(job.keywords),
     )
     recs = [RepoRecommendation.model_validate(r) for r in (app_row.github_recommendations or [])]
@@ -467,6 +526,7 @@ def update_change_decision(
         val = validate_claim_against_evidence(
             new_text=edited,
             original_text=change.original_text,
+            section=change.section,
             resume=ParsedResumeStructure.model_validate(resume.parsed_structure) if resume else ParsedResumeStructure(),
             raw_resume_text=resume.raw_text if resume else "",
             github_repos=gh_repos,
@@ -554,6 +614,8 @@ def export_resume_version(
             "original_text": ch.original_text,
             "new_text": ch.new_text,
             "edited_text": ch.edited_text,
+            "status": ch.status,
+            "validation_status": ch.validation_status,
         }
         for ch in version.changes
         if ch.status in {"accepted", "edited"} and ch.validation_status != "blocked"
@@ -564,36 +626,112 @@ def export_resume_version(
     out_docx = out_dir / "ResumeIQ_Optimized.docx"
     out_pdf = out_dir / "ResumeIQ_Optimized.pdf"
     out_png = out_dir / "preview_page1.png"
+    orig_png = out_dir / "orig_page1.png"
 
     source_path = Path(resume.storage_path)
     if not source_path.exists() and resume.file_bytes:
         source_path = out_dir / f"_source.{resume.file_type}"
         source_path.write_bytes(resume.file_bytes)
     orig_pages = resume.page_count
+    parsed = ParsedResumeStructure.model_validate(resume.parsed_structure)
+    elem_map = resume.element_map or {}
+
+    theme_warnings: list[str] = []
+    similarity_score: float | None = None
+    unchanged_similarity_score: float | None = None
+    export_blocked = False
+    orig_png_bytes: bytes | None = None
+    out_png_bytes: bytes | None = None
 
     if resume.file_type == "docx" and source_path.exists():
-        # Count original pages if not recorded yet
+        orig_pdf = out_dir / "_orig.pdf"
+        orig_pages_calc, used_lo_orig, _ = convert_docx_to_pdf_and_preview(source_path, orig_pdf, orig_png)
         if orig_pages is None:
-            orig_pdf = out_dir / "_orig.pdf"
-            orig_png = out_dir / "_orig.png"
-            orig_pages, _, _ = convert_docx_to_pdf_and_preview(source_path, orig_pdf, orig_png)
+            orig_pages = orig_pages_calc
             resume.page_count = orig_pages
             db.add(resume)
 
-        apply_changes_to_docx_in_place(
+        docx_warnings = apply_changes_to_docx_in_place(
             source_docx_path=source_path,
             output_docx_path=out_docx,
             approved_changes=approved_changes,
         )
-    else:
-        parsed = ParsedResumeStructure.model_validate(resume.parsed_structure)
+        theme_warnings.extend(docx_warnings)
+        out_pages, used_lo_out, lo_note = convert_docx_to_pdf_and_preview(out_docx, out_pdf, out_png)
+        if lo_note:
+            theme_warnings.append(lo_note)
+        if orig_pdf.exists() and out_pdf.exists() and used_lo_orig and used_lo_out:
+            verify = verify_pdf_theme_match(
+                original_pdf_path=orig_pdf,
+                output_pdf_path=out_pdf,
+                strategy_used="inplace_pdf",
+            )
+            similarity_score = verify.overall_similarity_score
+            unchanged_similarity_score = verify.unchanged_similarity_score
+            theme_warnings.extend(verify.warnings)
+            orig_png_bytes = verify.orig_preview_png or (orig_png.read_bytes() if orig_png.exists() else None)
+            out_png_bytes = verify.out_preview_png or (out_png.read_bytes() if out_png.exists() else None)
+            if not verify.passed:
+                export_blocked = True
+                if verify.blocked_reason:
+                    theme_warnings.insert(0, verify.blocked_reason)
+    elif resume.file_type == "pdf" and source_path.exists():
+        # Strategy B: in-place PyMuPDF edit first (falls back to Strategy C style-clone if needed)
+        pdf_res = apply_changes_to_pdf_in_place(
+            source_pdf_path=source_path,
+            output_pdf_path=out_pdf,
+            approved_changes=approved_changes,
+            resume_structure=parsed,
+        )
+        orig_pages = pdf_res.page_count_original
+        out_pages = pdf_res.page_count_output
+        if pdf_res.notice:
+            theme_warnings.append(pdf_res.notice)
+        theme_warnings.extend(pdf_res.font_substitutions)
+        theme_warnings.extend(pdf_res.warnings)
+
+        # Strategy D: Theme-match pixel & layout verification
+        verify = verify_pdf_theme_match(
+            original_pdf_path=source_path,
+            output_pdf_path=out_pdf,
+            changed_bboxes_by_page=pdf_res.changed_bboxes_by_page,
+            strategy_used=pdf_res.strategy_used,
+        )
+        similarity_score = verify.overall_similarity_score
+        unchanged_similarity_score = verify.unchanged_similarity_score
+        theme_warnings.extend(verify.warnings)
+        orig_png_bytes = verify.orig_preview_png
+        out_png_bytes = verify.out_preview_png
+        if orig_png_bytes:
+            orig_png.write_bytes(orig_png_bytes)
+        if out_png_bytes:
+            out_png.write_bytes(out_png_bytes)
+        if not verify.passed:
+            export_blocked = True
+            if verify.blocked_reason:
+                theme_warnings.insert(0, verify.blocked_reason)
+
+        # Also generate clean style-matched DOCX sibling (with all sections & hyperlinks)
         build_ats_docx_from_structure(
             structure=parsed,
             approved_changes=approved_changes,
             output_docx_path=out_docx,
+            style_tokens=elem_map.get("style_tokens"),
         )
+    else:
+        build_ats_docx_from_structure(
+            structure=parsed,
+            approved_changes=approved_changes,
+            output_docx_path=out_docx,
+            style_tokens=elem_map.get("style_tokens"),
+        )
+        out_pages, _, _ = convert_docx_to_pdf_and_preview(out_docx, out_pdf, out_png)
 
-    out_pages, _, _ = convert_docx_to_pdf_and_preview(out_docx, out_pdf, out_png)
+    if orig_png_bytes is None and orig_png.exists():
+        orig_png_bytes = orig_png.read_bytes()
+    if out_png_bytes is None and out_png.exists():
+        out_png_bytes = out_png.read_bytes()
+
     overflow = bool(orig_pages and out_pages > orig_pages)
     suggestions: list[str] = []
     if overflow:
@@ -602,19 +740,37 @@ def export_resume_version(
             "Consider rejecting lower-relevance project bullets or older experience lines rather than shrinking font sizes."
         )
 
-    version.output_docx_path = str(out_docx)
-    version.output_pdf_path = str(out_pdf)
-    version.preview_image_path = str(out_png)
+    version.output_docx_path = str(out_docx) if out_docx.exists() else None
+    version.output_pdf_path = str(out_pdf) if out_pdf.exists() else None
+    version.preview_image_path = str(out_png) if out_png.exists() else None
+    version.orig_preview_image_path = str(orig_png) if orig_png.exists() else None
     version.output_docx_bytes = out_docx.read_bytes() if out_docx.exists() else None
     version.output_pdf_bytes = out_pdf.read_bytes() if out_pdf.exists() else None
-    version.preview_image_bytes = out_png.read_bytes() if out_png.exists() else None
+    version.preview_image_bytes = out_png_bytes
+    version.orig_preview_image_bytes = orig_png_bytes
     version.page_count_original = orig_pages
     version.page_count_output = out_pages
     version.overflow_detected = overflow
     version.overflow_suggestions = suggestions
+    version.similarity_score = similarity_score
+    version.unchanged_similarity_score = unchanged_similarity_score
+    version.theme_warnings = list(dict.fromkeys(w for w in theme_warnings if w))
+    version.export_blocked = export_blocked
     db.add(version)
     db.commit()
     db.refresh(version)
+
+    if export_blocked:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": version.theme_warnings[0] if version.theme_warnings else "Layout similarity verification failed.",
+                "similarity_score": similarity_score,
+                "unchanged_similarity_score": unchanged_similarity_score,
+                "warnings": version.theme_warnings,
+                "version_id": version.id,
+            },
+        )
     return _to_version_response(version)
 
 
@@ -663,4 +819,9 @@ def download_version_artifact(
             return FileResponse(version.preview_image_path, media_type="image/png")
         if version.preview_image_bytes:
             return Response(content=version.preview_image_bytes, media_type="image/png")
+    if kind == "orig_preview":
+        if version.orig_preview_image_path and Path(version.orig_preview_image_path).exists():
+            return FileResponse(version.orig_preview_image_path, media_type="image/png")
+        if version.orig_preview_image_bytes:
+            return Response(content=version.orig_preview_image_bytes, media_type="image/png")
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export artifact not generated yet.")

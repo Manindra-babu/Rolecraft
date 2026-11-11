@@ -23,6 +23,7 @@ export default function NewApplicationPage() {
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
   const [selectedResumeId, setSelectedResumeId] = useState<string>("");
   const [githubInput, setGithubInput] = useState<string>("");
+  const [detectedGithubUrl, setDetectedGithubUrl] = useState<string>("");
   const [otherLink, setOtherLink] = useState<string>("");
   const [githubAnalysisId, setGithubAnalysisId] = useState<string | null>(null);
 
@@ -68,6 +69,22 @@ export default function NewApplicationPage() {
       setSelectedResumeId(resumes[0].id);
     }
   }, [resumes, selectedResumeId]);
+
+  useEffect(() => {
+    const selected = resumes?.find((r) => r.id === selectedResumeId);
+    if (!selected?.parsed_structure) return;
+    const fromLink = selected.parsed_structure.links?.find((l) =>
+      (l.url || "").toLowerCase().includes("github.com/")
+    )?.url;
+    const fromProj = selected.parsed_structure.projects?.find((p) =>
+      (p.url || "").toLowerCase().includes("github.com/")
+    )?.url;
+    const detected = fromLink || fromProj || "";
+    setDetectedGithubUrl(detected);
+    if (detected && !githubInput) {
+      setGithubInput(detected);
+    }
+  }, [resumes, selectedResumeId, githubInput]);
 
   const uploadMutation = useMutation({
     mutationFn: async (file: File) => {
@@ -206,6 +223,7 @@ export default function NewApplicationPage() {
           responsibilities: jobRecord.responsibilities,
           required_skills: reqSkillsText.split(",").map((s) => s.trim()).filter(Boolean),
           preferred_skills: prefSkillsText.split(",").map((s) => s.trim()).filter(Boolean),
+          or_groups: jobRecord.or_groups ?? [],
           keywords: jobRecord.keywords,
         }),
       });
@@ -338,6 +356,11 @@ export default function NewApplicationPage() {
           <Input
             label="GitHub profile URL or username"
             placeholder="https://github.com/your-username"
+            hint={
+              detectedGithubUrl
+                ? `Detected from your resume: ${detectedGithubUrl}`
+                : undefined
+            }
             value={githubInput}
             onChange={(e) => setGithubInput(e.target.value)}
           />

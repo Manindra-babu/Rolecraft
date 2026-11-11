@@ -1,7 +1,13 @@
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
+
+
+class SkillRequirementItem(BaseModel):
+    name: str
+    importance: Literal["required", "preferred"] = "required"
+    or_group: Optional[str] = None
 
 
 class StructuredJobFields(BaseModel):
@@ -10,8 +16,11 @@ class StructuredJobFields(BaseModel):
     location: str = ""
     experience_level: str = ""
     responsibilities: list[str] = Field(default_factory=list)
+    responsibilities_or_soft_requirements: list[str] = Field(default_factory=list)
     required_skills: list[str] = Field(default_factory=list)
     preferred_skills: list[str] = Field(default_factory=list)
+    skills: list[SkillRequirementItem] = Field(default_factory=list)
+    or_groups: list[list[str]] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
 
 
@@ -34,6 +43,7 @@ class JobPostingUpdateRequest(BaseModel):
     responsibilities: list[str] = Field(default_factory=list)
     required_skills: list[str] = Field(default_factory=list)
     preferred_skills: list[str] = Field(default_factory=list)
+    or_groups: list[list[str]] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
 
 
@@ -50,8 +60,11 @@ class JobPostingResponse(BaseModel):
     location: str = ""
     experience_level: str = ""
     responsibilities: list[str] = Field(default_factory=list)
+    responsibilities_or_soft_requirements: list[str] = Field(default_factory=list)
     required_skills: list[str] = Field(default_factory=list)
     preferred_skills: list[str] = Field(default_factory=list)
+    skills: list[SkillRequirementItem] = Field(default_factory=list)
+    or_groups: list[list[str]] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
     raw_text: str = ""
     fetched_at: Optional[datetime] = None

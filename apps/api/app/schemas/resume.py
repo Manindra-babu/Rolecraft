@@ -51,9 +51,11 @@ class ParsedResumeStructure(BaseModel):
     experience: list[ParsedExperienceItem] = Field(default_factory=list)
     projects: list[ParsedProjectItem] = Field(default_factory=list)
     skills: list[str] = Field(default_factory=list)
+    skill_categories: dict[str, list[str]] = Field(default_factory=dict)
     achievements: list[str] = Field(default_factory=list)
     certifications: list[str] = Field(default_factory=list)
     sections_order: list[str] = Field(default_factory=list)
+    completeness_warnings: list[str] = Field(default_factory=list)
 
 
 class ResumeUploadResponse(BaseModel):

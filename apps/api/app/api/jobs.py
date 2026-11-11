@@ -12,7 +12,12 @@ from app.schemas.job import (
     JobPostingResponse,
     JobPostingUpdateRequest,
 )
-from app.services.jobs.extractor import extract_job_from_text, extract_job_from_url
+from app.services.jobs.extractor import (
+    _build_skill_items,
+    _sanitize_raw_skill_items,
+    extract_job_from_text,
+    extract_job_from_url,
+)
 from app.services.jobs.ssrf import SSRFError
 from app.services.jobs.vision import extract_job_from_screenshot
 
@@ -32,8 +37,11 @@ def _to_job_response(job: JobPosting) -> JobPostingResponse:
         location=job.location,
         experience_level=job.experience_level,
         responsibilities=job.responsibilities,
+        responsibilities_or_soft_requirements=list(job.responsibilities),
         required_skills=job.required_skills,
         preferred_skills=job.preferred_skills,
+        skills=_build_skill_items(job.required_skills, job.preferred_skills, job.or_groups or []),
+        or_groups=job.or_groups or [],
         keywords=job.keywords,
         raw_text=job.raw_text,
         fetched_at=job.fetched_at,
@@ -128,8 +136,10 @@ def update_job_posting(
     job.location = payload.location.strip()
     job.experience_level = payload.experience_level.strip()
     job.responsibilities = payload.responsibilities
-    job.required_skills = payload.required_skills
-    job.preferred_skills = payload.preferred_skills
+    job.required_skills = _sanitize_raw_skill_items(payload.required_skills) or payload.required_skills
+    job.preferred_skills = _sanitize_raw_skill_items(payload.preferred_skills) or payload.preferred_skills
+    if payload.or_groups:
+        job.or_groups = [_sanitize_raw_skill_items(g) for g in payload.or_groups if g]
     job.keywords = payload.keywords
     db.add(job)
     db.commit()

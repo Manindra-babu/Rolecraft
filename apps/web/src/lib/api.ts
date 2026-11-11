@@ -81,8 +81,10 @@ export interface ParsedResumeStructure {
     element_ids?: string[];
   }>;
   skills: string[];
+  skill_categories?: Record<string, string[]>;
   achievements: string[];
   certifications: string[];
+  completeness_warnings?: string[];
   sections_order: string[];
 }
 
@@ -115,6 +117,7 @@ export interface JobPosting {
   responsibilities: string[];
   required_skills: string[];
   preferred_skills: string[];
+  or_groups?: string[][];
   keywords: string[];
   raw_text: string;
   fetched_at: string | null;
@@ -233,10 +236,15 @@ export interface ResumeVersion {
   has_docx: boolean;
   has_pdf: boolean;
   has_preview: boolean;
+  has_orig_preview?: boolean;
   page_count_original: number | null;
   page_count_output: number | null;
   overflow_detected: boolean;
   overflow_suggestions: string[];
+  similarity_score?: number | null;
+  unchanged_similarity_score?: number | null;
+  theme_warnings?: string[];
+  export_blocked?: boolean;
   changes: ChangeItem[];
   created_at: string;
 }
@@ -264,6 +272,9 @@ export interface ApplicationDetail {
   job_title: string;
   company: string;
   github_analysis_id: string | null;
+  github_status?: string;
+  github_username?: string | null;
+  github_repo_count?: number;
   compatibility_before: number | null;
   compatibility_after: number | null;
   score_breakdown: CompatibilityBreakdown | null;

@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -82,6 +83,36 @@ def parse_docx_resume(
 
     elements: list[dict[str, Any]] = []
     element_index = 0
+    R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+    def _extract_para_links(para) -> list[dict[str, str]]:
+        links: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for h in para._p.findall(f"{W_NS}hyperlink"):
+            rid = h.get(f"{R_NS}id")
+            if rid and rid in doc.part.rels:
+                target = str(doc.part.rels[rid].target_ref or "").strip()
+                if not target or target in seen:
+                    continue
+                seen.add(target)
+                low = target.lower()
+                if low.startswith("mailto:") or ("@" in target and not low.startswith("http")):
+                    continue
+                label = (
+                    "GitHub"
+                    if "github.com" in low
+                    else ("LinkedIn" if "linkedin.com" in low else "Website")
+                )
+                links.append({"label": label, "url": target})
+        return links
+
+    def _is_para_bold(para) -> bool:
+        runs = [r for r in para.runs if r.text and r.text.strip()]
+        if not runs:
+            return False
+        bold_chars = sum(len(r.text.strip()) for r in runs if r.bold)
+        total = sum(len(r.text.strip()) for r in runs)
+        return (bold_chars / max(1, total)) >= 0.55
 
     def add_element(
         text: str,
@@ -93,9 +124,12 @@ def parse_docx_resume(
         col_index: int | None = None,
         style_name: str = "",
         is_bullet: bool = False,
+        is_bold: bool = False,
+        links: list[dict[str, str]] | None = None,
     ) -> None:
         nonlocal element_index
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        cleaned_text = re.sub(r"[\uE000-\uF8FF\ufffd\u25af]+", "", text or "")
+        lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
         for line_idx, cleaned in enumerate(lines):
             el_id = f"el_{element_index}"
             element_index += 1
@@ -111,39 +145,51 @@ def parse_docx_resume(
                     "col_index": col_index,
                     "style_name": style_name,
                     "is_bullet": is_bullet or cleaned.startswith(("•", "-", "–", "*")),
+                    "is_bold": is_bold,
+                    "links": links or [],
                     "section": "other",
                 }
             )
 
-    # Body paragraphs
-    for p_idx, para in enumerate(doc.paragraphs):
-        add_element(
-            para.text,
-            kind="body_paragraph",
-            paragraph_index=p_idx,
-            style_name=(para.style.name if para.style else "") or "",
-            is_bullet=_paragraph_is_bullet(para),
-        )
+    # Index lookup for body paragraphs & tables so elements keep exact python-docx coordinates
+    body_para_by_xml = {id(p._p): (idx, p) for idx, p in enumerate(doc.paragraphs)}
+    table_by_xml = {id(t._tbl): (idx, t) for idx, t in enumerate(doc.tables)}
 
-    # Table cell paragraphs
-    for t_idx, table in enumerate(doc.tables):
-        for r_idx, row in enumerate(table.rows):
-            seen_cells = set()
-            for c_idx, cell in enumerate(row.cells):
-                if id(cell._tc) in seen_cells:
-                    continue
-                seen_cells.add(id(cell._tc))
-                for p_idx, para in enumerate(cell.paragraphs):
-                    add_element(
-                        para.text,
-                        kind="table_cell_paragraph",
-                        paragraph_index=p_idx,
-                        table_index=t_idx,
-                        row_index=r_idx,
-                        col_index=c_idx,
-                        style_name=(para.style.name if para.style else "") or "",
-                        is_bullet=_paragraph_is_bullet(para),
-                    )
+    # Walk document body in true visual reading order (interleaving tables & paragraphs)
+    for child in doc.element.body:
+        cid = id(child)
+        if cid in body_para_by_xml:
+            p_idx, para = body_para_by_xml[cid]
+            add_element(
+                para.text,
+                kind="body_paragraph",
+                paragraph_index=p_idx,
+                style_name=(para.style.name if para.style else "") or "",
+                is_bullet=_paragraph_is_bullet(para),
+                is_bold=_is_para_bold(para),
+                links=_extract_para_links(para),
+            )
+        elif cid in table_by_xml:
+            t_idx, table = table_by_xml[cid]
+            for r_idx, row in enumerate(table.rows):
+                seen_cells: set[int] = set()
+                for c_idx, cell in enumerate(row.cells):
+                    if id(cell._tc) in seen_cells:
+                        continue
+                    seen_cells.add(id(cell._tc))
+                    for p_idx, para in enumerate(cell.paragraphs):
+                        add_element(
+                            para.text,
+                            kind="table_cell_paragraph",
+                            paragraph_index=p_idx,
+                            table_index=t_idx,
+                            row_index=r_idx,
+                            col_index=c_idx,
+                            style_name=(para.style.name if para.style else "") or "",
+                            is_bullet=_paragraph_is_bullet(para),
+                            is_bold=_is_para_bold(para),
+                            links=_extract_para_links(para),
+                        )
 
     # Textbox paragraphs (if present)
     if layout_type == "textbox_based":

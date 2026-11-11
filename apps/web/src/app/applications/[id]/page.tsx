@@ -36,18 +36,22 @@ const CATEGORY_META: Array<{
   title: string;
   tone: "success" | "accent" | "warning" | "danger" | "neutral";
 }> = [
-  { key: "demonstrated", title: "1. Skills already demonstrated", tone: "success" },
+  { key: "demonstrated", title: "1. Demonstrated (experience, projects, or certs)", tone: "success" },
   {
     key: "under_represented",
-    title: "2. Present but insufficiently represented in resume",
+    title: "2. Insufficiently represented (Skills list only)",
     tone: "accent",
   },
   {
     key: "github_only",
-    title: "3. Supported by GitHub evidence, absent from resume",
+    title: "3. GitHub-supported (absent from resume)",
     tone: "accent",
   },
-  { key: "needs_development", title: "4. Skills needing further development", tone: "warning" },
+  {
+    key: "needs_development",
+    title: "4. Possible adjacent skill (needs development)",
+    tone: "warning",
+  },
   { key: "missing", title: "5. Skills genuinely missing", tone: "danger" },
 ];
 
@@ -64,6 +68,7 @@ export default function ApplicationWorkspacePage() {
   const [editingText, setEditingText] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [origPreviewUrl, setOrigPreviewUrl] = useState<string | null>(null);
   const [notesDraft, setNotesDraft] = useState<string>("");
 
   useEffect(() => {
@@ -104,36 +109,80 @@ export default function ApplicationWorkspacePage() {
     }
   }, [filteredChanges, selectedChangeId]);
 
-  // Load authenticated preview PNG when exported
+  // Load authenticated preview PNGs (result + original) when exported
   useEffect(() => {
     let active = true;
-    let objectUrl: string | null = null;
+    const urls: string[] = [];
     async function loadPreview() {
-      if (!latestVersion?.has_preview) {
+      if (!latestVersion?.id) {
         setPreviewUrl(null);
+        setOrigPreviewUrl(null);
         return;
       }
       const token = getStoredToken();
-      const resp = await fetch(
-        `${API_BASE}/applications/${appId}/versions/${latestVersion.id}/download/preview`,
-        { headers: token ? { Authorization: `Bearer ${token}` } : {} }
-      );
-      if (resp.ok && active) {
-        const blob = await resp.blob();
-        objectUrl = URL.createObjectURL(blob);
-        setPreviewUrl(objectUrl);
+      const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {};
+      if (latestVersion.has_preview) {
+        const resp = await fetch(
+          `${API_BASE}/applications/${appId}/versions/${latestVersion.id}/download/preview`,
+          { headers }
+        );
+        if (resp.ok && active) {
+          const blob = await resp.blob();
+          const u = URL.createObjectURL(blob);
+          urls.push(u);
+          setPreviewUrl(u);
+        }
+      } else {
+        setPreviewUrl(null);
+      }
+      if (latestVersion.has_orig_preview) {
+        const origResp = await fetch(
+          `${API_BASE}/applications/${appId}/versions/${latestVersion.id}/download/orig_preview`,
+          { headers }
+        );
+        if (origResp.ok && active) {
+          const blob = await origResp.blob();
+          const u = URL.createObjectURL(blob);
+          urls.push(u);
+          setOrigPreviewUrl(u);
+        }
+      } else {
+        setOrigPreviewUrl(null);
       }
     }
     loadPreview();
     return () => {
       active = false;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      urls.forEach((u) => URL.revokeObjectURL(u));
     };
-  }, [appId, latestVersion?.id, latestVersion?.has_preview]);
+  }, [appId, latestVersion?.id, latestVersion?.has_preview, latestVersion?.has_orig_preview]);
 
   const invalidateApp = useCallback(async () => {
     await queryClient.invalidateQueries({ queryKey: ["application", appId] });
   }, [queryClient, appId]);
+
+  const confirmLearningMutation = useMutation({
+    mutationFn: ({
+      planId,
+      confirmed,
+      completedSteps,
+    }: {
+      planId: string;
+      confirmed: boolean;
+      completedSteps: string[];
+    }) =>
+      apiFetch(`/learning/${planId}/progress`, {
+        method: "PUT",
+        body: JSON.stringify({
+          completed_steps: completedSteps,
+          user_confirmed_learning: confirmed,
+          confirmation_note: "confirmed from application workspace",
+        }),
+      }),
+    onSuccess: invalidateApp,
+    onError: (err) =>
+      setActionError(err instanceof ApiError ? err.message : "Could not update learning status."),
+  });
 
   const githubDecisionMutation = useMutation({
     mutationFn: (item: { repo_name: string; decision: "approved" | "rejected" }) =>
@@ -361,6 +410,26 @@ export default function ApplicationWorkspacePage() {
                 Weighted across required skills, preferred skills, experience
                 relevance, keywords, and project evidence.
               </p>
+              <div className="border-t border-border pt-2">
+                <p className="text-xs font-medium text-ink">
+                  GitHub Analysis Status:
+                </p>
+                <div className="mt-1 flex flex-wrap items-center gap-2">
+                  <Badge
+                    tone={
+                      app.github_status?.startsWith("analyzed")
+                        ? "success"
+                        : app.github_status?.startsWith("unavailable")
+                        ? "warning"
+                        : "neutral"
+                    }
+                  >
+                    {app.github_username
+                      ? `@${app.github_username} (${app.github_repo_count ?? 0} repos)`
+                      : app.github_status || "not_provided"}
+                  </Badge>
+                </div>
+              </div>
             </Card>
 
             <Card className="space-y-3 md:col-span-2">
@@ -414,16 +483,47 @@ export default function ApplicationWorkspacePage() {
                     </div>
                     {items.length > 0 ? (
                       <ul className="space-y-1.5 text-xs">
-                        {items.map((item) => (
-                          <li key={item.skill_name} className="space-y-0.5">
-                            <span className="font-semibold text-ink">
-                              {item.skill_name}
-                            </span>{" "}
-                            <span className="text-ink-muted">
-                              ({item.importance}) — {item.evidence_summary}
-                            </span>
-                          </li>
-                        ))}
+                        {items.map((item) => {
+                          const linkedPlan =
+                            cat.key === "missing" || cat.key === "needs_development"
+                              ? app.learning_plans.find(
+                                  (lp) =>
+                                    lp.skill_name.toLowerCase() === item.skill_name.toLowerCase()
+                                )
+                              : undefined;
+                          return (
+                            <li key={item.skill_name} className="space-y-1">
+                              <div>
+                                <span className="font-semibold text-ink">
+                                  {item.skill_name}
+                                </span>{" "}
+                                <span className="text-ink-muted">
+                                  ({item.importance}) — {item.evidence_summary}
+                                </span>
+                              </div>
+                              {linkedPlan?.id && (
+                                <div className="flex items-center gap-2">
+                                  <Button
+                                    size="sm"
+                                    variant={linkedPlan.user_confirmed_learning ? "primary" : "secondary"}
+                                    disabled={confirmLearningMutation.isPending}
+                                    onClick={() =>
+                                      confirmLearningMutation.mutate({
+                                        planId: linkedPlan.id!,
+                                        confirmed: !linkedPlan.user_confirmed_learning,
+                                        completedSteps: linkedPlan.completed_steps,
+                                      })
+                                    }
+                                  >
+                                    {linkedPlan.user_confirmed_learning
+                                      ? "Confirmed: Currently Learning"
+                                      : "Are you currently learning this? Confirm"}
+                                  </Button>
+                                </div>
+                              )}
+                            </li>
+                          );
+                        })}
                       </ul>
                     ) : (
                       <p className="text-xs text-ink-muted">None in this category.</p>
@@ -911,14 +1011,34 @@ export default function ApplicationWorkspacePage() {
           ) : (
             app.learning_plans.map((plan) => (
               <Card key={plan.skill_name} className="space-y-2">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <h3 className="text-base font-semibold">{plan.skill_name}</h3>
-                  <Badge tone="warning">{plan.category.replace("_", " ")}</Badge>
+                  <div className="flex items-center gap-2">
+                    <Badge tone="warning">{plan.category.replace("_", " ")}</Badge>
+                    {plan.id && (
+                      <Button
+                        size="sm"
+                        variant={plan.user_confirmed_learning ? "primary" : "secondary"}
+                        disabled={confirmLearningMutation.isPending}
+                        onClick={() =>
+                          confirmLearningMutation.mutate({
+                            planId: plan.id!,
+                            confirmed: !plan.user_confirmed_learning,
+                            completedSteps: plan.completed_steps,
+                          })
+                        }
+                      >
+                        {plan.user_confirmed_learning
+                          ? "Currently Learning (Confirmed)"
+                          : "Mark as Currently Learning"}
+                      </Button>
+                    )}
+                  </div>
                 </div>
                 <p className="text-xs text-ink-muted">{plan.how_to_demonstrate}</p>
                 <p className="text-xs text-ink">
-                  {plan.ordered_steps.length} steps &middot; Open the Learning tab
-                  in the main nav to track step completion.
+                  {plan.ordered_steps.length} steps &middot; Re-generate tailored
+                  changes in Review after confirming to include a &ldquo;Currently Learning&rdquo; line.
                 </p>
               </Card>
             ))
@@ -931,10 +1051,10 @@ export default function ApplicationWorkspacePage() {
           <Card className="space-y-4">
             <h2 className="text-lg font-semibold">Export Optimized Resume</h2>
             {app.resume_file_type === "pdf" && (
-              <Alert tone="warning">
-                Because your input was a PDF, ResumeIQ will generate a clean,
-                ATS-friendly DOCX approximating your content rather than editing
-                PDF glyphs directly.
+              <Alert tone="info">
+                Exact formatting needs a DOCX. Your PDF export edits the
+                original PDF in place first to preserve fonts, colors, rules,
+                and links; the optional DOCX download uses matched style tokens.
               </Alert>
             )}
 
@@ -945,9 +1065,47 @@ export default function ApplicationWorkspacePage() {
                   disabled={exportMutation.isPending}
                 >
                   {exportMutation.isPending
-                    ? "Building DOCX & rendering PDF..."
+                    ? "Preserving theme & rendering..."
+                    : app.resume_file_type === "pdf"
+                    ? "Build Theme-Preserved PDF & DOCX"
                     : "Build Final DOCX & PDF"}
                 </Button>
+
+                {latestVersion.similarity_score != null && (
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <Badge
+                      tone={
+                        (latestVersion.unchanged_similarity_score ?? 100) >= 95
+                          ? "success"
+                          : "danger"
+                      }
+                    >
+                      Unchanged regions match:{" "}
+                      {latestVersion.unchanged_similarity_score ?? latestVersion.similarity_score}%
+                    </Badge>
+                    <Badge tone="neutral">
+                      Overall layout similarity: {latestVersion.similarity_score}%
+                    </Badge>
+                  </div>
+                )}
+
+                {latestVersion.theme_warnings &&
+                  latestVersion.theme_warnings.length > 0 && (
+                    <Alert
+                      tone={latestVersion.export_blocked ? "danger" : "warning"}
+                      title={
+                        latestVersion.export_blocked
+                          ? "Export blocked: unexpected layout diff"
+                          : "Theme & font notices"
+                      }
+                    >
+                      <ul className="list-disc pl-4 text-xs">
+                        {latestVersion.theme_warnings.map((w, i) => (
+                          <li key={i}>{w}</li>
+                        ))}
+                      </ul>
+                    </Alert>
+                  )}
 
                 {latestVersion.overflow_detected && (
                   <Alert tone="warning" title="Page overflow detected">
@@ -974,19 +1132,24 @@ export default function ApplicationWorkspacePage() {
                   </div>
                 )}
 
-                {latestVersion.has_docx && (
+                {(latestVersion.has_docx || latestVersion.has_pdf) && (
                   <div className="flex flex-wrap gap-3 pt-2">
-                    <Button onClick={() => handleDownload("docx")}>
-                      <Download className="h-4 w-4" />
-                      Download DOCX
-                    </Button>
                     {latestVersion.has_pdf && (
                       <Button
-                        variant="secondary"
+                        variant={app.resume_file_type === "pdf" ? "primary" : "secondary"}
                         onClick={() => handleDownload("pdf")}
                       >
                         <Download className="h-4 w-4" />
                         Download PDF
+                      </Button>
+                    )}
+                    {latestVersion.has_docx && (
+                      <Button
+                        variant={app.resume_file_type === "pdf" ? "secondary" : "primary"}
+                        onClick={() => handleDownload("docx")}
+                      >
+                        <Download className="h-4 w-4" />
+                        Download DOCX
                       </Button>
                     )}
                   </div>
@@ -1036,17 +1199,47 @@ export default function ApplicationWorkspacePage() {
           </Card>
 
           <Card className="space-y-3">
-            <h2 className="text-lg font-semibold">Rendered Page 1 Preview</h2>
-            {previewUrl ? (
-              <img
-                src={previewUrl}
-                alt="Rendered optimized resume page 1 preview"
-                className="w-full rounded border border-border bg-white"
-              />
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h2 className="text-lg font-semibold">
+                Original vs. Result Preview
+              </h2>
+              {latestVersion?.similarity_score != null && (
+                <Badge tone="accent">
+                  Similarity {latestVersion.similarity_score}%
+                </Badge>
+              )}
+            </div>
+            {previewUrl || origPreviewUrl ? (
+              <div className={origPreviewUrl ? "grid gap-3 md:grid-cols-2" : ""}>
+                {origPreviewUrl && (
+                  <div className="space-y-1">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-ink-muted">
+                      Original
+                    </p>
+                    <img
+                      src={origPreviewUrl}
+                      alt="Original resume page 1 preview"
+                      className="w-full rounded border border-border bg-white"
+                    />
+                  </div>
+                )}
+                {previewUrl && (
+                  <div className="space-y-1">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-ink-muted">
+                      Optimized Result
+                    </p>
+                    <img
+                      src={previewUrl}
+                      alt="Rendered optimized resume page 1 preview"
+                      className="w-full rounded border border-border bg-white"
+                    />
+                  </div>
+                )}
+              </div>
             ) : (
               <div className="rounded-md border border-dashed border-border bg-canvas p-12 text-center text-sm text-ink-muted">
                 Click &ldquo;Build Final DOCX &amp; PDF&rdquo; to render and
-                verify page layout.
+                verify page layout side by side.
               </div>
             )}
           </Card>

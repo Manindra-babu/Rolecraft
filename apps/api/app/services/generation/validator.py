@@ -4,16 +4,24 @@ from typing import Any
 
 from app.schemas.github import AnalyzedRepo
 from app.schemas.resume import ParsedResumeStructure
-from app.services.matching.normalizer import normalize_skill, skill_in_text
+from app.services.matching.normalizer import (
+    find_direct_and_implied_skills,
+    normalize_skill,
+    skill_in_text,
+)
 
 KNOWN_TOOLS = [
-    "Python", "TypeScript", "JavaScript", "Java", "Go", "Rust", "C++", "C#", "SQL",
-    "FastAPI", "Django", "Flask", "React", "Next.js", "Node.js", "Express", "Spring Boot",
+    "Python", "TypeScript", "JavaScript", "Java", "Go", "Rust", "C", "C++", "C#", "SQL",
+    "HTML", "HTML5", "CSS", "Tailwind CSS", "DOM", "AJAX", "HTTP", "SOA", "Web Services",
+    "FastAPI", "Django", "Flask", "React", "Next.js", "Node.js", "Express", "MERN", "Spring Boot",
     "PostgreSQL", "MySQL", "MongoDB", "Redis", "SQLite", "Docker", "Kubernetes",
-    "AWS", "GCP", "Azure", "Terraform", "Git", "GitHub Actions", "CI/CD",
-    "REST APIs", "GraphQL", "PyTorch", "TensorFlow", "Playwright", "pytest", "Linux",
+    "AWS", "GCP", "Azure", "Terraform", "Git", "GitHub", "GitHub Actions", "CI/CD",
+    "REST", "REST APIs", "GraphQL", "PyTorch", "TensorFlow", "Playwright", "pytest", "Linux",
     "Kafka", "Spark", "Snowflake", "Airflow", "Celery", "RabbitMQ", "Elasticsearch",
+    "Firebase", "ChromaDB", "Groq", "Linux",
 ]
+
+BAD_GLYPH_RE = re.compile(r"[\uE000-\uF8FF\ufffd\u25af]")
 
 NUMBER_METRIC_RE = re.compile(
     r"(?:\$?\d+(?:[.,]\d+)?(?:\s?[%kKmMbBxX+]|ms|s|hrs?|hours?|days?|weeks?|months?|years?)?)"
@@ -101,8 +109,12 @@ def build_evidence_corpus(
     for tool in KNOWN_TOOLS:
         if skill_in_text(tool, corpus):
             allowed_tools.add(normalize_skill(tool))
+    for implied_norm in find_direct_and_implied_skills(corpus).keys():
+        allowed_tools.add(implied_norm)
     for sk in resume.skills:
         allowed_tools.add(normalize_skill(sk))
+        for implied_norm in find_direct_and_implied_skills(sk).keys():
+            allowed_tools.add(implied_norm)
     for repo in github_repos or []:
         if repo.excluded_reason is None:
             for sk in repo.inferred_skills:
@@ -119,12 +131,52 @@ def validate_claim_against_evidence(
     raw_resume_text: str,
     github_repos: list[AnalyzedRepo] | None = None,
     confirmed_learning: list[dict[str, Any]] | None = None,
+    section: str = "",
 ) -> ValidationResult:
     """
-    Deterministic truthfulness validation layer (Section 7).
-    Extracts numbers/metrics, tools, and leadership scope verbs from `new_text`
-    and verifies every claim against the user's evidence corpus.
+    Deterministic truthfulness + structural integrity validation layer.
+    Extracts numbers/metrics, tools, leadership scope verbs, and checks
+    integrity rules (no empty items, no stray glyphs/periods, no duplicated
+    tokens, skill categories preserved).
     """
+    integrity_errors: list[str] = []
+    stripped_new = (new_text or "").strip()
+    if not stripped_new:
+        integrity_errors.append("Integrity check failed: proposed item cannot be empty.")
+
+    if BAD_GLYPH_RE.search(stripped_new):
+        integrity_errors.append("Integrity check failed: stray private-use or symbol glyph detected.")
+
+    # No duplicated prefix/word typos introduced or left behind (e.g. 'Detail- Detail-oriented')
+    if re.search(r"\b([A-Za-z]{3,}-)\s+\1", stripped_new, re.I):
+        integrity_errors.append("Integrity check failed: duplicated hyphenated word detected.")
+
+    # Skill category & trailing period check
+    if section == "skills":
+        orig_cat_m = re.match(r"^\s*([A-Za-z][A-Za-z &/+]{1,35}):\s*", original_text or "")
+        if orig_cat_m:
+            expected_label = orig_cat_m.group(1).strip()
+            if not stripped_new.lower().startswith(f"{expected_label.lower()}:"):
+                integrity_errors.append(
+                    f"Integrity check failed: skill category label '{expected_label}:' must be preserved."
+                )
+        skills_body = stripped_new.split(":", 1)[1] if ":" in stripped_new else stripped_new
+        raw_parts = [p.strip() for p in re.split(r"[,|;]+", skills_body) if p.strip()]
+        if not raw_parts:
+            integrity_errors.append("Integrity check failed: skills line contains no skill items.")
+        for sp in raw_parts:
+            if sp.endswith("."):
+                integrity_errors.append(
+                    f"Integrity check failed: trailing period in skill '{sp}'."
+                )
+                break
+
+    # Balanced parenthesis check (don't introduce stray '(' or ')' absent from original)
+    if stripped_new.count("(") != stripped_new.count(")") and (
+        (original_text or "").count("(") == (original_text or "").count(")")
+    ):
+        integrity_errors.append("Integrity check failed: unbalanced parenthesis in text.")
+
     corpus, allowed_numbers, allowed_tools, refs = build_evidence_corpus(
         resume=resume,
         raw_resume_text=raw_resume_text,
@@ -161,7 +213,7 @@ def validate_claim_against_evidence(
                     f"Inflated verb '{verb}' has no leadership evidence; consider '{honest_alt}'."
                 )
 
-    warnings: list[str] = []
+    warnings: list[str] = list(integrity_errors)
     if unverified_numbers:
         warnings.append(
             f"Blocked unverified metric(s)/number(s) absent from evidence: {', '.join(unverified_numbers)}"
@@ -172,7 +224,7 @@ def validate_claim_against_evidence(
         )
     warnings.extend(inflated_verbs)
 
-    if unverified_numbers or unverified_tools:
+    if integrity_errors or unverified_numbers or unverified_tools:
         status = "blocked"
     elif inflated_verbs:
         status = "flagged"

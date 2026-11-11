@@ -188,7 +188,10 @@ def test_end_to_end_application_review_and_export(client: TestClient, monkeypatc
 
     # 6. Accept/edit a change; ensure blocked unverified edit cannot be accepted
     if ver["changes"]:
-        ch = ver["changes"][0]
+        ch = next(
+            (c for c in ver["changes"] if c["change_type"] == "reworded" and c["section"] == "experience"),
+            ver["changes"][0],
+        )
         bad_edit = client.patch(
             f"/api/v1/applications/{app_id}/changes/{ch['id']}",
             headers=headers,
@@ -198,11 +201,16 @@ def test_end_to_end_application_review_and_export(client: TestClient, monkeypatc
         assert bad_edit.json()["validation_status"] == "blocked"
         assert bad_edit.json()["status"] == "pending"
 
-        # Valid edit is accepted
+        # Valid edit is accepted (keeping skills category label intact when editing skills)
+        valid_edit_text = (
+            "Languages & Frameworks: Python, FastAPI, PostgreSQL, Docker"
+            if ch["section"] == "skills"
+            else "Built FastAPI microservices in Python with PostgreSQL."
+        )
         good_edit = client.patch(
             f"/api/v1/applications/{app_id}/changes/{ch['id']}",
             headers=headers,
-            json={"status": "edited", "edited_text": "Built FastAPI microservices in Python with PostgreSQL."},
+            json={"status": "edited", "edited_text": valid_edit_text},
         )
         assert good_edit.status_code == 200
         assert good_edit.json()["validation_status"] == "passed"
