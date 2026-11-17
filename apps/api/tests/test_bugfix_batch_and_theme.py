@@ -196,10 +196,17 @@ def test_item6_optimizer_typos_categories_and_no_auto_accept(client: TestClient,
     assert changes, "Expected tailored change proposals"
     assert all(ch["status"] == "pending" for ch in changes), "No change may be auto-accepted"
 
-    skill_changes = [ch for ch in changes if ch["section"] == "skills"]
+    skill_changes = [
+        ch for ch in changes
+        if ch["section"] == "skills" and ch["change_type"] in {"reordered", "reworded"}
+    ]
     for sc in skill_changes:
         orig_cat = sc["original_text"].split(":", 1)[0].strip()
         assert sc["new_text"].startswith(f"{orig_cat}:"), f"Lost category label in {sc}"
+    learning_changes = [ch for ch in changes if ch["change_type"] == "user_confirmed_skill"]
+    assert len(learning_changes) == 1
+    assert learning_changes[0]["section"] == "skills"
+    assert learning_changes[0]["new_text"].startswith("Currently Learning:")
 
     combined_new = "\n".join(ch["new_text"] for ch in changes)
     # Typo fixes present when those typos exist in source PDF
@@ -602,7 +609,8 @@ def test_round3_inplace_2col_github_grid_completeness_and_overflow(tmp_path: Pat
         approved_github_recs=recs3,
     )
     for c in changes3:
-        c["status"] = "accepted"
+        if c.get("change_type") != "relevance_trim":
+            c["status"] = "accepted"
     out_ov = tmp_path / "overflow3.pdf"
     res_ov = apply_changes_to_pdf_in_place(
         source_pdf_path=MANINDRA_PDF,
@@ -815,3 +823,1230 @@ def test_zero_change_single_span_cache_and_similarity_gate(
     assert compute_export_cache_key([], source_file_type="pdf").startswith(f"{EXPORT_CODE_VERSION}:")
     dl_blocked = client.get(f"/api/v1/applications/{app_row.id}/versions/{ver.id}/download/pdf", headers=headers)
     assert dl_blocked.status_code == 409
+
+
+def test_round4_skills_redraw_overlap_gate_and_currently_learning(tmp_path: Path) -> None:
+    from app.services.resume.theme_verifier import check_pdf_text_overlaps
+
+    parsed, elem_map, raw_text, _ = parse_pdf_resume(MANINDRA_PDF)
+    job = _load_paypal_job()
+
+    # Negative check: synthetic PDF with overlapping spans must fail check_pdf_text_overlaps
+    overlap_pdf = tmp_path / "synthetic_overlap.pdf"
+    odoc = fitz.open()
+    opage = odoc.new_page(width=612, height=792)
+    opage.insert_text((72, 200), "Web Technologies: HTML5, CSS, JavaScript, MERN", fontsize=10.5)
+    opage.insert_text((88, 201), "Currently Learning: AJAX, Web Services, SOA", fontsize=10.5)
+    odoc.save(str(overlap_pdf))
+    odoc.close()
+    ov_fail, ov_details = check_pdf_text_overlaps(output_pdf_path=overlap_pdf)
+    assert ov_fail is False
+    assert len(ov_details) >= 1
+
+    # Positive check: Task 1 whole-block Skills redraw + Task 2 single consolidated Currently Learning line
+    changes = generate_tailored_changes(
+        resume=parsed,
+        raw_resume_text=raw_text,
+        element_map=elem_map,
+        job=job,
+        confirmed_learning=[
+            {"skill": "AJAX", "note": "MDN Fetch course"},
+            {"skill": "Web Services"},
+            {"skill": "SOA"},
+        ],
+    )
+    uc_changes = [c for c in changes if c.get("change_type") == "user_confirmed_skill"]
+    assert len(uc_changes) == 1
+    assert uc_changes[0]["section"] == "skills"
+    assert uc_changes[0]["new_text"] == "Currently Learning: AJAX, Web Services, SOA"
+
+    # Evidence-backed Web Technologies expansion should spell out MERN + REST APIs without fabricating Java/C++/SQL
+    wt_changes = [
+        c for c in changes
+        if c["section"] == "skills" and "web technologies" in str(c.get("original_text", "")).lower()
+    ]
+    assert wt_changes, f"Expected Web Technologies enhancement: {changes}"
+    wt_new = wt_changes[0]["new_text"]
+    for tok in ("Node.js", "Express.js", "MongoDB", "React"):
+        assert tok in wt_new
+    # No fabricated claims for unverified/missing skills
+    skills_blob = " ".join(c.get("new_text", "") for c in changes if c["section"] == "skills")
+    assert "Kubernetes" not in skills_blob
+
+    for c in changes:
+        if c["change_type"] != "relevance_trim":
+            c["status"] = "accepted"
+
+    out_pdf = tmp_path / "round4_skills_and_learning.pdf"
+    res = apply_changes_to_pdf_in_place(
+        source_pdf_path=MANINDRA_PDF,
+        output_pdf_path=out_pdf,
+        approved_changes=changes,
+        resume_structure=parsed,
+    )
+    assert res.overlap_passed is True, res.overlap_details
+    assert res.overlap_details == []
+
+    # Verify both columns + bold category labels + standalone Currently Learning line exist in exported PDF
+    edoc = fitz.open(str(out_pdf))
+    epage = edoc[0]
+    etxt = epage.get_text("text")
+    assert "Currently Learning: AJAX, Web Services, SOA" in etxt
+    assert "Databases: SQL." in etxt
+    assert "CS Fundamentals:" in etxt
+    # Never merged into Web Technologies proficient line
+    wt_line = [ln for ln in etxt.splitlines() if "Web Technologies:" in ln]
+    assert wt_line and "AJAX" not in wt_line[0]
+    edoc.close()
+
+
+def test_round4_relevance_typos_github_sentences_and_learning_api(
+    client: TestClient,
+    db_session,
+    tmp_path: Path,
+) -> None:
+    from app.models.application import Application, ResumeVersion
+    from app.models.learning import LearningPlan
+    from app.models.job import JobPosting
+    from app.models.resume import ResumeFile
+    from app.models.user import User
+    from app.schemas.github import AnalyzedRepo, BulletEvidenceItem, RepoEvidenceSignals, RepoRecommendation
+    from app.services.generation.relevance import score_resume_relevance
+    from app.services.github.scorer import build_factual_repo_bullets_with_evidence
+
+    parsed, elem_map, raw_text, _ = parse_pdf_resume(MANINDRA_PDF)
+    job = _load_paypal_job()
+
+    # 1. Task 4: Relevance Review scores blocks & honors AI-interest toggle
+    rel = score_resume_relevance(resume=parsed, job=job)
+    assert rel
+    assert any(r["section"] == "certifications" and r["tier"] == "low" for r in rel)
+    assert any(r["section"] == "experience" and r["tier"] == "high" for r in rel)
+
+    changes_no_ai = generate_tailored_changes(
+        resume=parsed,
+        raw_resume_text=raw_text,
+        element_map=elem_map,
+        job=job,
+        keep_ai_interest=False,
+    )
+    changes_with_ai = generate_tailored_changes(
+        resume=parsed,
+        raw_resume_text=raw_text,
+        element_map=elem_map,
+        job=job,
+        keep_ai_interest=True,
+    )
+    sum_no_ai = next(c for c in changes_no_ai if c["section"] == "summary" and len(c["new_text"]) > 40)
+    sum_with_ai = next(c for c in changes_with_ai if c["section"] == "summary" and len(c["new_text"]) > 40)
+    assert "Detail- Detail-oriented" not in sum_no_ai["new_text"]
+    assert "Artificial Intelligence" in sum_with_ai["new_text"]
+    assert "Artificial Intelligence" not in sum_no_ai["new_text"]
+
+    # 2. Task 5: Factual repo bullets are complete sentences mentioning frontend (no mid-sentence cutoffs)
+    gh_repo = AnalyzedRepo(
+        name="Surplus-Food-Donation-Matcher",
+        full_name="Manindra-babu/Surplus-Food-Donation-Matcher",
+        html_url="https://github.com/Manindra-babu/Surplus-Food-Donation-Matcher",
+        description="Autonomous surplus food rescue agent powered by LangGraph, Google Gemini and FastAPI",
+        primary_language="TypeScript",
+        languages={"TypeScript": 4500, "Python": 4000, "HTML": 1000, "CSS": 800},
+        dependencies=["react", "fastapi", "langgraph"],
+        inferred_skills=["TypeScript", "Python", "React", "FastAPI", "HTML", "CSS"],
+        readme_excerpt="Surplus food rescue agent using React UI and FastAPI backend with rate limiting and food-safety validation.",
+        signals=RepoEvidenceSignals(has_readme=True, file_count=79, total_commits=11, user_commits=11, user_commit_share=1.0),
+    )
+    bullets, bullets_ev = build_factual_repo_bullets_with_evidence(gh_repo)
+    assert bullets and bullets_ev
+    first_bullet = bullets[0]
+    assert first_bullet.endswith((".", "!", "?"))
+    assert "API rate." not in first_bullet
+    assert "React" in first_bullet or "TypeScript/HTML/CSS" in first_bullet
+
+    # 3. Task 6: All 5 typo fixes + INTER + 2 GitHub projects + relevance trims fit on 1 page cleanly
+    recs = [
+        RepoRecommendation(
+            repo_name="Decision-IQ",
+            full_name="Manindra-babu/Decision-IQ",
+            html_url="https://github.com/Manindra-babu/Decision-IQ",
+            quality_score=95,
+            relevance_score=87.4,
+            matched_skills=["React", "JavaScript", "HTML", "Python"],
+            reason="AI roadmap generator",
+            decision="approved",
+            draft_bullets=[
+                "Built an interactive React and FastAPI roadmap generator with dynamic node canvas graphs and learning path tracking."
+            ],
+            bullet_evidence=[BulletEvidenceItem(bullet="Built...", source="README + dependencies", detail="README.md")],
+        ),
+        RepoRecommendation(
+            repo_name="Surplus-Food-Donation-Matcher",
+            full_name="Manindra-babu/Surplus-Food-Donation-Matcher",
+            html_url="https://github.com/Manindra-babu/Surplus-Food-Donation-Matcher",
+            quality_score=95,
+            relevance_score=87.4,
+            matched_skills=["TypeScript", "React", "HTML", "Python"],
+            reason="Autonomous food rescue agent",
+            decision="approved",
+            draft_bullets=[first_bullet],
+            bullet_evidence=bullets_ev,
+        ),
+    ]
+    full_changes = generate_tailored_changes(
+        resume=parsed,
+        raw_resume_text=raw_text,
+        element_map=elem_map,
+        job=job,
+        github_repos=[gh_repo],
+        approved_github_recs=recs,
+        confirmed_learning=[
+            {"skill": "AJAX", "note": "MDN Fetch"},
+            {"skill": "Web Services"},
+            {"skill": "SOA"},
+        ],
+    )
+    all_orig_new = " ".join(
+        f"{c.get('original_text','')} -> {c.get('new_text','')}" for c in full_changes
+    )
+    for fixed in ("KNOWLEDGE", "RETRIEVAL", "causal masking", "constraints", "Detail-oriented", "INTERN"):
+        assert fixed in all_orig_new, f"Missing typo fix {fixed}"
+    assert any(c.get("change_type") == "relevance_trim" for c in full_changes)
+
+    for c in full_changes:
+        c["status"] = "accepted"
+
+    out_fit = tmp_path / "round4_all_accepted_fit.pdf"
+    res_fit = apply_changes_to_pdf_in_place(
+        source_pdf_path=MANINDRA_PDF,
+        output_pdf_path=out_fit,
+        approved_changes=full_changes,
+        resume_structure=parsed,
+        tighten_spacing=True,
+    )
+    assert res_fit.overlap_passed is True, res_fit.overlap_details
+    assert res_fit.page_fit.get("passed") is True, res_fit.page_fit
+    assert res_fit.overflow_detected is False
+
+    # 4. Task 2 & 3 API persistence: LearningPlan note + application detail relevance_review
+    reg = client.post(
+        "/api/v1/auth/register",
+        json={"email": "r4user@example.com", "password": "StrongPassword123!", "full_name": "R4 User"},
+    )
+    assert reg.status_code == 201
+    headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
+    user = db_session.query(User).filter(User.email == "r4user@example.com").first()
+    assert user is not None
+
+    pdf_bytes = MANINDRA_PDF.read_bytes()
+    resume_row = ResumeFile(
+        user_id=user.id,
+        filename="manindra_resume.pdf",
+        file_type="pdf",
+        file_size=len(pdf_bytes),
+        storage_path=str(MANINDRA_PDF),
+        file_bytes=pdf_bytes,
+        layout_type="pdf",
+        page_count=1,
+        parsed_structure=parsed.model_dump(mode="json"),
+        element_map=elem_map,
+        raw_text=raw_text,
+    )
+    job_row = JobPosting(
+        user_id=user.id,
+        title=job.title or "Software Engineer Intern",
+        company=job.company or "PayPal",
+        raw_text="JavaScript HTML DOM AJAX Node.js Web Services SOA React Java C++",
+        required_skills=list(job.required_skills),
+        preferred_skills=list(job.preferred_skills),
+        responsibilities=list(job.responsibilities),
+        keywords=list(job.keywords),
+    )
+    db_session.add_all([resume_row, job_row])
+    db_session.flush()
+
+    app_row = Application(
+        user_id=user.id,
+        resume_file_id=resume_row.id,
+        job_posting_id=job_row.id,
+        status="Draft",
+        compatibility_before=75.0,
+    )
+    db_session.add(app_row)
+    db_session.flush()
+
+    lp1 = LearningPlan(
+        user_id=user.id,
+        application_id=app_row.id,
+        skill_name="AJAX",
+        category="missing",
+        plan_data={
+            "technologies": ["AJAX"],
+            "ordered_steps": [],
+            "resources": [],
+            "how_to_demonstrate": "Build async fetch flow",
+        },
+    )
+    lp2 = LearningPlan(
+        user_id=user.id,
+        application_id=app_row.id,
+        skill_name="Java",
+        category="under_represented",
+        plan_data={
+            "technologies": ["Java"],
+            "ordered_steps": [],
+            "resources": [],
+            "how_to_demonstrate": "Build a Spring Boot service or coursework repo.",
+        },
+    )
+    ver = ResumeVersion(application_id=app_row.id, version_number=1, page_count_original=1)
+    db_session.add_all([lp1, lp2, ver])
+    db_session.commit()
+    db_session.refresh(lp1)
+
+    upd = client.put(
+        f"/api/v1/learning/{lp1.id}/progress",
+        json={
+            "completed_steps": ["s1"],
+            "user_confirmed_learning": True,
+            "confirmation_note": "MDN Fetch & AJAX Course",
+            "application_id": app_row.id,
+        },
+        headers=headers,
+    )
+    assert upd.status_code == 200, upd.text
+    assert upd.json()["confirmation_note"] == "MDN Fetch & AJAX Course"
+
+    detail = client.get(f"/api/v1/applications/{app_row.id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    d_json = detail.json()
+    assert len(d_json["relevance_review"]) >= 5
+    latest_ver = d_json["versions"][-1]
+    uc_rows = [c for c in latest_ver["changes"] if c["change_type"] == "user_confirmed_skill"]
+    assert len(uc_rows) == 1
+    assert uc_rows[0]["section"] == "skills"
+    assert uc_rows[0]["new_text"] == "Currently Learning: AJAX"
+
+
+def test_round5_completeness_cisco_pagefit_styling_wording_accuracy(client, db_session, tmp_path: Path) -> None:
+    """
+    Round 5 comprehensive regression test covering:
+      1. Never delete CISCO/RedHat/Microsoft or Education bullets without explicit approval; completeness gate blocks unapproved drops.
+      2. Protect 'CISCO - C Essentials 1' whenever C or C++ is in job requirements.
+      3. Page-fit gate blocks margin < 12pt or overflow and returns 3 structured options with before/after previews + API choice.
+      4. Summary preserves run-level Italic + BoldItalic fonts (never flattened to plain).
+      5. Wording quality (no REST/HTTP or PyTorch/Python redundancy, 'responsive' kept, grammatical 'an interactive...') + MERN/Firebase accuracy prompt.
+      6. Skills bullets match original dot size (>= 10.5pt) and indentation with 0 overlaps.
+    """
+    import fitz
+    from app.models.application import Application, Change, ResumeVersion
+    from app.models.job import JobPosting
+    from app.models.resume import ResumeFile
+    from app.models.user import User
+    from app.schemas.github import AnalyzedRepo, BulletEvidenceItem, RepoEvidenceSignals, RepoRecommendation
+    from app.services.generation.optimizer import generate_tailored_changes
+    from app.services.generation.relevance import score_resume_relevance
+    from app.services.github.scorer import build_factual_repo_bullets_with_evidence
+    from app.services.resume.pdf_editor import apply_changes_to_pdf_in_place
+    from app.services.resume.theme_verifier import verify_exported_pdf_completeness
+
+    parsed, elem_map, raw_text, _ = parse_pdf_resume(MANINDRA_PDF)
+    job = _load_paypal_job()
+
+    # 1. CISCO C Essentials 1 must be protected when C++ is required
+    rel_items = score_resume_relevance(resume=parsed, job=job)
+    cisco_items = [r for r in rel_items if "cisco" in str(r.get("text", "")).lower() and "c essentials" in str(r.get("text", "")).lower()]
+    assert len(cisco_items) == 1, rel_items
+    assert cisco_items[0]["recommended_action"] == "keep", cisco_items[0]
+    assert float(cisco_items[0]["score"]) >= 0.60, cisco_items[0]
+
+    # 2. Generate tailored changes -> no redundancy, 'responsive' kept, MERN prompt flagged, 0 auto-accepted removals
+    changes = generate_tailored_changes(
+        resume=parsed,
+        raw_resume_text=raw_text,
+        element_map=elem_map,
+        job=job,
+    )
+    all_prop_text = " ".join(c.get("new_text", "") for c in changes)
+    assert "(HTTP/REST)" not in all_prop_text
+    assert "PyTorch (Python)" not in all_prop_text
+    assert all(c.get("status", "pending") == "pending" for c in changes)
+    # Never propose removing CISCO C Essentials while C++ is required
+    cisco_trims = [c for c in changes if c.get("change_type") == "relevance_trim" and "cisco" in c.get("original_text", "").lower()]
+    assert len(cisco_trims) == 0, cisco_trims
+
+    # Check 'responsive' preserved on first internship bullet & MERN prompt flagged
+    exp_bullets = [c for c in changes if c.get("section") == "experience" and c.get("change_type") == "reworded"]
+    first_bul = next((c for c in exp_bullets if "responsive" in c.get("original_text", "").lower()), None)
+    assert first_bul is not None, exp_bullets
+    assert "responsive" in first_bul["new_text"].lower(), first_bul
+    assert "Did you use MongoDB at this internship (the next line says Firebase)?" in str(
+        (first_bul.get("target_location") or {}).get("accuracy_prompt") or ""
+    )
+    assert first_bul.get("validation_status") == "flagged"
+    assert (first_bul.get("target_location") or {}).get("requires_confirmation") is True
+    assert "Express.js, React" in str((first_bul.get("target_location") or {}).get("without_mongodb") or "")
+
+    # 3. GitHub factual bullets grammar: proper indefinite article & no '/' slash stack
+    diq_repo = AnalyzedRepo(
+        name="Decision-IQ",
+        full_name="Manindra-babu/Decision-IQ",
+        html_url="https://github.com/Manindra-babu/Decision-IQ",
+        description="Interactive AI-powered roadmap generator and decision intelligence platform featuring dynamic node canvas graphs",
+        primary_language="JavaScript",
+        languages={"JavaScript": 6000, "Python": 3000, "CSS": 1000},
+        dependencies=["react", "fastapi"],
+        inferred_skills=["React", "FastAPI", "Python", "JavaScript", "HTML"],
+        readme_excerpt="Interactive AI-powered roadmap generator featuring dynamic node canvas graphs and learning path tracking.",
+        signals=RepoEvidenceSignals(has_readme=True, file_count=39, total_commits=15, user_commits=15, user_commit_share=1.0, has_tests=True),
+    )
+    bullets_diq, _ = build_factual_repo_bullets_with_evidence(diq_repo)
+    assert bullets_diq[0].startswith("Built Decision-IQ, an interactive AI-powered roadmap generator"), bullets_diq
+    assert "FastAPI / JavaScript" not in bullets_diq[0]
+
+    # 4. Run-level styling preservation in Summary & Skills bullet size/indent
+    summary_ch = next(
+        (c for c in changes if c.get("section") == "summary" and len(c.get("original_text", "")) > 40),
+        None,
+    )
+    skills_ch = [c for c in changes if c.get("section") == "skills" and c.get("change_type") in {"reordered", "reworded"}]
+    styled_only = [dict(c, status="accepted") for c in ([summary_ch] if summary_ch else []) + skills_ch[:2]]
+    out_styled = tmp_path / "round5_styled.pdf"
+    res_styled = apply_changes_to_pdf_in_place(
+        source_pdf_path=MANINDRA_PDF,
+        output_pdf_path=out_styled,
+        approved_changes=styled_only,
+        resume_structure=parsed,
+        relevance_items=rel_items,
+    )
+    assert res_styled.overlap_passed is True, res_styled.overlap_details
+    assert res_styled.page_fit.get("passed") is True, res_styled.page_fit
+    assert float(res_styled.page_fit.get("margin_pt", 0)) >= 12.0
+
+    # Verify BOTH BoldItalic and Italic runs are preserved in Summary, and ALL certs/Education bullets remain intact
+    sdoc = fitz.open(str(out_styled))
+    spage = sdoc[0]
+    td = spage.get_text("dict")
+    summary_fonts: list[tuple[str, int, str]] = []
+    skill_bullet_sizes: list[float] = []
+    full_out_txt = spage.get_text("text")
+    for blk in td.get("blocks", []):
+        if blk.get("type") != 0:
+            continue
+        for ln in blk.get("lines", []):
+            y0 = float(ln["bbox"][1])
+            for sp in ln.get("spans", []):
+                if 115.0 <= y0 <= 180.0 and sp.get("text", "").strip():
+                    summary_fonts.append((str(sp.get("font", "")), int(sp.get("flags", 0)), sp.get("text", "")))
+                if 595.0 <= y0 <= 675.0 and sp.get("text", "").strip() == "•":
+                    skill_bullet_sizes.append(float(sp.get("size", 0.0)))
+    sdoc.close()
+
+    assert any((fl & 16) or "bold" in fn.lower() for fn, fl, _ in summary_fonts), summary_fonts
+    assert any((fl & 2) or "italic" in fn.lower() for fn, fl, _ in summary_fonts), summary_fonts
+    assert skill_bullet_sizes and min(skill_bullet_sizes) >= 10.5, skill_bullet_sizes
+    for must_keep in ("C Essentials 1", "Red Hat OpenShift", "Python for Data Science", "Excel Associate", "100+ peers", "technical documentation"):
+        assert must_keep in full_out_txt, f"Missing unapproved removal: {must_keep}"
+
+    # Completeness gate: removing CISCO or Education bullet without accepted removal MUST fail
+    comp_doc = fitz.open(str(out_styled))
+    cp0 = comp_doc[0]
+    for hit in cp0.search_for("Red Hat OpenShift"):
+        cp0.add_redact_annot(hit, fill=(1, 1, 1))
+    cp0.apply_redactions()
+    missing_cert_pdf = tmp_path / "missing_cert.pdf"
+    comp_doc.save(str(missing_cert_pdf))
+    comp_doc.close()
+    ok_missing, errs_missing = verify_exported_pdf_completeness(
+        original_pdf_path=MANINDRA_PDF,
+        output_pdf_path=missing_cert_pdf,
+        applied_changes=styled_only,
+    )
+    assert ok_missing is False
+    assert any("red hat" in e.lower() for e in errs_missing), errs_missing
+
+    # 5. End-to-end API checks: MERN accuracy prompt enforcement + Page-fit <12pt/overflow 422 gate & 3 preview options
+    reg = client.post(
+        "/api/v1/auth/register",
+        json={"email": "r5user@example.com", "password": "StrongPassword123!", "full_name": "R5 User"},
+    )
+    assert reg.status_code == 201
+    headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
+    user = db_session.query(User).filter(User.email == "r5user@example.com").first()
+    pdf_bytes = MANINDRA_PDF.read_bytes()
+    resume_row = ResumeFile(
+        user_id=user.id,
+        filename="manindra_resume.pdf",
+        file_type="pdf",
+        file_size=len(pdf_bytes),
+        storage_path=str(MANINDRA_PDF),
+        file_bytes=pdf_bytes,
+        layout_type="pdf",
+        page_count=1,
+        parsed_structure=parsed.model_dump(mode="json"),
+        element_map=elem_map,
+        raw_text=raw_text,
+    )
+    job_row = JobPosting(
+        user_id=user.id,
+        title=job.title or "Software Engineer Intern",
+        company=job.company or "PayPal",
+        raw_text="JavaScript React Node.js C++ REST APIs",
+        required_skills=list(job.required_skills),
+        preferred_skills=list(job.preferred_skills),
+        responsibilities=list(job.responsibilities),
+        keywords=list(job.keywords),
+    )
+    db_session.add_all([resume_row, job_row])
+    db_session.flush()
+    app_row = Application(
+        user_id=user.id,
+        resume_file_id=resume_row.id,
+        job_posting_id=job_row.id,
+        status="Draft",
+        compatibility_before=75.0,
+    )
+    db_session.add(app_row)
+    db_session.flush()
+    ver = ResumeVersion(application_id=app_row.id, version_number=1, page_count_original=1)
+    db_session.add(ver)
+    db_session.flush()
+
+    mern_ch = Change(
+        resume_version_id=ver.id,
+        section="experience",
+        change_type="reworded",
+        target_location=first_bul["target_location"],
+        original_text=first_bul["original_text"],
+        new_text=first_bul["new_text"],
+        reason=first_bul["reason"],
+        evidence_refs=[],
+        validation_status="flagged",
+        validation_warnings=["Confirm MongoDB usage before applying"],
+        status="pending",
+    )
+    proj1_ch = Change(
+        resume_version_id=ver.id,
+        section="projects",
+        change_type="added_from_github",
+        target_location={"repo_name": "Decision-IQ", "html_url": "https://github.com/Manindra-babu/Decision-IQ", "skills": ["React", "FastAPI"]},
+        original_text="",
+        new_text="Decision-IQ | React, JavaScript, Python | https://github.com/Manindra-babu/Decision-IQ\n• Built Decision-IQ, an interactive AI-powered roadmap generator featuring dynamic node canvas graphs.\n• Added automated unit tests for core components.",
+        reason="Relevant project",
+        evidence_refs=[],
+        validation_status="passed",
+        validation_warnings=[],
+        status="accepted",
+    )
+    proj2_ch = Change(
+        resume_version_id=ver.id,
+        section="projects",
+        change_type="added_from_github",
+        target_location={"repo_name": "Surplus-Food-Donation-Matcher", "html_url": "https://github.com/Manindra-babu/Surplus-Food-Donation-Matcher", "skills": ["React", "Python"]},
+        original_text="",
+        new_text="Surplus-Food-Donation-Matcher | React, Python, FastAPI | https://github.com/Manindra-babu/Surplus-Food-Donation-Matcher\n• Built Surplus-Food-Donation-Matcher, an AI matching agent with validation and human approval gating.\n• Added integration test coverage across key routes.",
+        reason="Relevant project",
+        evidence_refs=[],
+        validation_status="passed",
+        validation_warnings=[],
+        status="accepted",
+    )
+    db_session.add_all([mern_ch, proj1_ch, proj2_ch])
+    db_session.commit()
+    db_session.refresh(mern_ch)
+
+    # Cannot accept MERN expansion without answering accuracy confirmation
+    bad_acc = client.patch(
+        f"/api/v1/applications/{app_row.id}/changes/{mern_ch.id}",
+        json={"status": "accepted"},
+        headers=headers,
+    )
+    assert bad_acc.status_code == 400
+    assert "MongoDB" in bad_acc.json()["detail"]
+
+    # Answering No (Firebase used) rewrites without MongoDB cleanly
+    no_mongo = client.patch(
+        f"/api/v1/applications/{app_row.id}/changes/{mern_ch.id}",
+        json={"status": "accepted", "accuracy_confirmed": False},
+        headers=headers,
+    )
+    assert no_mongo.status_code == 200, no_mongo.text
+    assert no_mongo.json()["status"] == "edited"
+    assert "MongoDB" not in (no_mongo.json()["edited_text"] or "")
+    assert "Express.js, React" in (no_mongo.json()["edited_text"] or "")
+
+    # Exporting 2 added projects with 0 removals triggers page-fit block (422) + 3 preview options
+    exp_block = client.post(f"/api/v1/applications/{app_row.id}/versions/{ver.id}/export", headers=headers)
+    assert exp_block.status_code == 422, exp_block.text
+    det = exp_block.json()["detail"]
+    assert det["page_fit"]["passed"] is False
+    opts = det["page_fit"].get("options") or []
+    assert [o["id"] for o in opts] == ["shorten_projects", "condense_education", "drop_lowest_relevance"]
+    assert all("previews" in o for o in opts)
+
+    # Choosing 'drop_lowest_relevance' trims lowest-relevance item(s) cleanly and if still tight, 'shorten_projects' fits 1 page >= 12pt margin
+    pick = client.post(
+        f"/api/v1/applications/{app_row.id}/versions/{ver.id}/page-fit-option",
+        json={"option_id": "drop_lowest_relevance"},
+        headers=headers,
+    )
+    assert pick.status_code == 200, pick.text
+
+    exp_retry = client.post(f"/api/v1/applications/{app_row.id}/versions/{ver.id}/export", headers=headers)
+    if exp_retry.status_code == 422:
+        client.post(
+            f"/api/v1/applications/{app_row.id}/versions/{ver.id}/page-fit-option",
+            json={"option_id": "shorten_projects"},
+            headers=headers,
+        )
+        exp_retry = client.post(f"/api/v1/applications/{app_row.id}/versions/{ver.id}/export", headers=headers)
+    assert exp_retry.status_code == 200, exp_retry.text
+    ok_json = exp_retry.json()
+    assert ok_json["page_fit"]["passed"] is True
+    assert float(ok_json["page_fit"]["margin_pt"]) >= 12.0
+    assert ok_json["overlap_passed"] is True
+    assert ok_json["export_blocked"] is False
+
+
+def test_round6_no_lost_content_richer_projects_skills_spacing(tmp_path: Path, client, db_session):
+    """
+    Round 6 regression test (fail-first):
+      1. Zero accepted changes and typical non-removal edits preserve ALL Certifications (w/ links & bold labels) and all Education bullets.
+      2. Removing a multi-link block (RedHat) never clips adjacent Certification lines (IBM/CISCO).
+      3. Richer Decision-IQ & Surplus-Food-Donation-Matcher descriptions include React/FastAPI (+ LangGraph/Gemini) in 2-3 grammatical lines with evidence.
+      4. Skills ordering keeps CSS next to HTML5/JavaScript and C next to C++, and generates pending 'casual masking' -> 'causal masking'.
+      5. Section-to-divider-rule gaps stay >= original gaps.
+      6. Completeness failure exposes structured `missing_blocks` on export block response.
+    """
+    import fitz
+    from app.models.application import Application, ResumeVersion
+    from app.models.job import JobPosting
+    from app.models.resume import ResumeFile
+    from app.models.user import User
+    from app.schemas.github import AnalyzedRepo, BulletEvidenceItem, RepoEvidenceSignals, RepoRecommendation
+    from app.services.generation.optimizer import generate_tailored_changes
+    from app.services.generation.relevance import score_resume_relevance
+    from app.services.github.scorer import build_factual_repo_bullets_with_evidence
+    from app.services.resume.pdf_editor import apply_changes_to_pdf_in_place
+    from app.services.resume.theme_verifier import verify_exported_pdf_completeness
+
+    assert MANINDRA_PDF.exists()
+    parsed, elem_map, raw_text, _ = parse_pdf_resume(MANINDRA_PDF)
+    job = _load_paypal_job()
+    rel_items = score_resume_relevance(resume=parsed, job=job)
+
+    # Richer GitHub repo cards for Decision-IQ and Surplus-Food-Donation-Matcher
+    diq_repo = AnalyzedRepo(
+        name="Decision-IQ",
+        full_name="Manindra-babu/Decision-IQ",
+        html_url="https://github.com/Manindra-babu/Decision-IQ",
+        description="Interactive AI-powered roadmap generator and decision intelligence platform featuring dynamic node canvas graphs",
+        primary_language="JavaScript",
+        languages={"JavaScript": 6200, "Python": 3400, "CSS": 900},
+        dependencies=["react", "fastapi", "uvicorn"],
+        inferred_skills=["React", "FastAPI", "Python", "JavaScript", "HTML"],
+        readme_excerpt="Interactive AI-powered roadmap generator with React Flow canvas and FastAPI backend services.",
+        signals=RepoEvidenceSignals(
+            has_readme=True, file_count=39, total_commits=15, user_commits=15, user_commit_share=1.0, has_tests=True
+        ),
+    )
+    sfdm_repo = AnalyzedRepo(
+        name="Surplus-Food-Donation-Matcher",
+        full_name="Manindra-babu/Surplus-Food-Donation-Matcher",
+        html_url="https://github.com/Manindra-babu/Surplus-Food-Donation-Matcher",
+        description="AI-powered surplus food matching agent connecting donors with shelters using multi-step human-in-the-loop validation",
+        primary_language="Python",
+        languages={"Python": 5500, "JavaScript": 2800},
+        dependencies=["react", "fastapi", "langgraph", "google-generativeai"],
+        inferred_skills=["React", "FastAPI", "LangGraph", "Gemini", "Python"],
+        readme_excerpt="AI food matching workflow orchestrated with LangGraph and Google Gemini over a React frontend and FastAPI API.",
+        signals=RepoEvidenceSignals(
+            has_readme=True, file_count=28, total_commits=12, user_commits=12, user_commit_share=1.0, has_tests=True
+        ),
+    )
+
+    b_diq, ev_diq = build_factual_repo_bullets_with_evidence(diq_repo)
+    b_sfdm, ev_sfdm = build_factual_repo_bullets_with_evidence(sfdm_repo)
+    assert "react" in b_diq[0].lower() and "fastapi" in b_diq[0].lower(), b_diq
+    assert all(k in b_sfdm[0].lower() for k in ("react", "fastapi", "langgraph", "gemini")), b_sfdm
+    assert ev_diq and ev_sfdm
+
+    recs_r6 = [
+        RepoRecommendation(
+            repo_name="Decision-IQ",
+            full_name="Manindra-babu/Decision-IQ",
+            html_url="https://github.com/Manindra-babu/Decision-IQ",
+            quality_score=95,
+            relevance_score=90.0,
+            matched_skills=["React", "FastAPI", "Python", "JavaScript"],
+            reason="Full-stack React + FastAPI roadmap platform",
+            decision="approved",
+            draft_bullets=b_diq,
+            bullet_evidence=ev_diq,
+        ),
+        RepoRecommendation(
+            repo_name="Surplus-Food-Donation-Matcher",
+            full_name="Manindra-babu/Surplus-Food-Donation-Matcher",
+            html_url="https://github.com/Manindra-babu/Surplus-Food-Donation-Matcher",
+            quality_score=95,
+            relevance_score=89.0,
+            matched_skills=["React", "FastAPI", "LangGraph", "Gemini", "Python"],
+            reason="Multi-agent workflow with React, FastAPI, LangGraph, and Gemini",
+            decision="approved",
+            draft_bullets=b_sfdm,
+            bullet_evidence=ev_sfdm,
+        ),
+    ]
+    changes = generate_tailored_changes(
+        resume=parsed,
+        raw_resume_text=raw_text,
+        element_map=elem_map,
+        job=job,
+        github_repos=[diq_repo, sfdm_repo],
+        approved_github_recs=recs_r6,
+    )
+
+    # Skills ordering constraints + pending casual->causal typo check
+    # Round 7: C, C++, Java, Python should NOT be unnecessarily reordered; keep canonical C, C++ order.
+    lang_ch = next(
+        (c for c in changes if c.get("section") == "skills" and "Programming Languages:" in (c.get("new_text") or "")),
+        None,
+    )
+    web_ch = next(
+        (c for c in changes if c.get("section") == "skills" and "Web Technologies:" in (c.get("new_text") or "")),
+        None,
+    )
+    assert lang_ch is None, f"Unexpected Programming Languages reorder: {lang_ch}"
+    assert web_ch is not None
+    assert "html5, css, javascript" in web_ch["new_text"].lower() or "css, html5" in web_ch["new_text"].lower(), web_ch["new_text"]
+
+    casual_typo = next(
+        (c for c in changes if "casual masking" in (c.get("original_text") or "").lower()),
+        None,
+    )
+    assert casual_typo is not None and casual_typo.get("status", "pending") == "pending"
+    assert "causal masking" in (casual_typo.get("new_text") or "").lower()
+
+    # 1. Zero accepted changes: ALL original text + all Certifications + all Education bullets preserved
+    zero_out = tmp_path / "round6_zero.pdf"
+    res_zero = apply_changes_to_pdf_in_place(
+        source_pdf_path=MANINDRA_PDF,
+        output_pdf_path=zero_out,
+        approved_changes=[],
+        resume_structure=parsed,
+        relevance_items=rel_items,
+    )
+    comp_zero_ok, comp_zero_errs = verify_exported_pdf_completeness(
+        original_pdf_path=MANINDRA_PDF,
+        output_pdf_path=zero_out,
+        applied_changes=[],
+    )
+    assert comp_zero_ok, comp_zero_errs
+    assert res_zero.overlap_passed is True
+
+    # 2. Typical accepted set (NO removals accepted, WITH 2 rich projects + Summary + Exp + Typos + Skills + Currently Learning)
+    typical_approved: list[dict] = []
+    for c in changes:
+        if c.get("change_type") == "relevance_trim":
+            continue
+        if (c.get("target_location") or {}).get("requires_confirmation"):
+            # Simulate user confirming Firebase (No MongoDB)
+            cc = dict(c)
+            cc["status"] = "edited"
+            cc["edited_text"] = (c.get("target_location") or {}).get("without_mongodb") or c["new_text"]
+            cc["validation_status"] = "passed"
+            cc["target_location"] = {**(c.get("target_location") or {}), "accuracy_confirmed": False}
+            typical_approved.append(cc)
+        else:
+            typical_approved.append(dict(c, status="accepted"))
+
+    typical_approved.append({
+        "section": "skills",
+        "change_type": "user_confirmed_skill",
+        "original_text": "",
+        "new_text": "Currently Learning: AJAX, Web Services, SOA",
+        "reason": "User confirmed currently learning.",
+        "status": "accepted",
+        "validation_status": "passed",
+        "target_location": {"mode": "currently_learning", "skills": ["AJAX", "Web Services", "SOA"]},
+    })
+
+    # Make sure the two rich repo additions use our fuller 2-3 line descriptions
+    for cc in typical_approved:
+        if cc.get("change_type") == "added_from_github":
+            rname = (cc.get("target_location") or {}).get("repo_name", "")
+            if "Decision-IQ" in rname:
+                cc["new_text"] = f"Decision-IQ | React, FastAPI | https://github.com/Manindra-babu/Decision-IQ\n• {b_diq[0]}"
+            elif "Surplus-Food" in rname:
+                cc["new_text"] = f"Surplus-Food-Donation-Matcher | React, FastAPI, LangGraph, Gemini | https://github.com/Manindra-babu/Surplus-Food-Donation-Matcher\n• {b_sfdm[0]}"
+
+    out_typical = tmp_path / "round6_typical.pdf"
+    res_typ = apply_changes_to_pdf_in_place(
+        source_pdf_path=MANINDRA_PDF,
+        output_pdf_path=out_typical,
+        approved_changes=typical_approved,
+        resume_structure=parsed,
+        tighten_spacing=True,
+        relevance_items=rel_items,
+    )
+    assert res_typ.overlap_passed is True, res_typ.overlap_details
+    assert res_typ.page_count_output == 1, res_typ.page_fit
+    assert float((res_typ.page_fit or {}).get("margin_pt", -1)) >= 12.0, res_typ.page_fit
+
+    comp_typ_ok, comp_typ_errs = verify_exported_pdf_completeness(
+        original_pdf_path=MANINDRA_PDF,
+        output_pdf_path=out_typical,
+        applied_changes=typical_approved,
+    )
+    assert comp_typ_ok, comp_typ_errs
+
+    od = fitz.open(str(out_typical))
+    op = od[0]
+    out_txt = op.get_text("text")
+    out_uris = {str(lk.get("uri") or "") for lk in (op.get_links() or [])}
+    for req_txt in (
+        "C Essentials 1",
+        "Red Hat OpenShift",
+        "Red Hat System Administration I & II",
+        "Python for Data Science",
+        "Excel Associate",
+        "Power Platform Fundamentals",
+        "100+ peers",
+        "technical documentation",
+        "Currently Learning:",
+        "AJAX, Web Services, SOA",
+        "causal masking",
+        "Decision-IQ",
+        "Surplus-Food-Donation-Matcher",
+        "LangGraph",
+        "Gemini",
+    ):
+        assert req_txt.lower() in out_txt.lower(), f"Missing expected text '{req_txt}' in output"
+
+    # Check every original Certification URI is preserved
+    orig_d = fitz.open(str(MANINDRA_PDF))
+    orig_p = orig_d[0]
+    for lk in orig_p.get_links() or []:
+        u = str(lk.get("uri") or "")
+        if u:
+            assert u in out_uris, f"Lost hyperlink: {u}"
+
+    # Verify section-to-divider-rule gap >= original gap (within 0.5pt)
+    def _section_end_to_rule_gaps(page_obj: fitz.Page) -> list[float]:
+        from app.services.resume.pdf_editor import _detect_horizontal_rules
+
+        pw = float(page_obj.rect.width)
+        rules = _detect_horizontal_rules(page_obj, pw)
+        line_y1s: list[float] = []
+        for blk in page_obj.get_text("dict").get("blocks", []):
+            if blk.get("type") != 0:
+                continue
+            for ln in blk.get("lines", []):
+                if "".join(s.get("text", "") for s in ln.get("spans", [])).strip():
+                    line_y1s.append(float(ln["bbox"][3]))
+        gaps: list[float] = []
+        prev_r1 = 0.0
+        for r0, r1 in rules:
+            below_prev = [y1 for y1 in line_y1s if prev_r1 <= y1 <= r0 + 0.5]
+            if below_prev:
+                gaps.append(round(r0 - max(below_prev), 2))
+            prev_r1 = r1
+        return gaps
+
+    orig_gaps = _section_end_to_rule_gaps(orig_p)
+    out_gaps = _section_end_to_rule_gaps(op)
+    orig_d.close()
+    od.close()
+    assert len(out_gaps) == len(orig_gaps), (orig_gaps, out_gaps)
+    for idx_g, (og, ng) in enumerate(zip(orig_gaps, out_gaps)):
+        assert ng >= og - 0.5, f"Rule {idx_g} gap shrank from {og}pt to {ng}pt"
+
+    # 3. Single multi-link removal (RedHat) when explicitly removed by user must NOT clip IBM or CISCO
+    redhat_line = next((c for c in parsed.certifications if "redhat" in c.lower()), "RedHat - Red Hat OpenShift , Red Hat System Administration I & II")
+    redhat_trim = next(
+        (c for c in changes if c.get("change_type") == "relevance_trim" and "redhat" in (c.get("original_text") or "").lower()),
+        None,
+    ) or {
+        "section": "certifications",
+        "change_type": "relevance_trim",
+        "original_text": redhat_line,
+        "new_text": "",
+        "status": "pending",
+        "reason": "User explicit removal of RedHat certification",
+    }
+    assert redhat_trim is not None
+    rh_out = tmp_path / "round6_only_rh_removed.pdf"
+    rh_approved = [dict(redhat_trim, status="accepted")]
+    apply_changes_to_pdf_in_place(
+        source_pdf_path=MANINDRA_PDF,
+        output_pdf_path=rh_out,
+        approved_changes=rh_approved,
+        resume_structure=parsed,
+        relevance_items=rel_items,
+    )
+    rh_ok, rh_errs = verify_exported_pdf_completeness(
+        original_pdf_path=MANINDRA_PDF,
+        output_pdf_path=rh_out,
+        applied_changes=rh_approved,
+    )
+    assert rh_ok, rh_errs
+    rhd = fitz.open(str(rh_out))
+    rh_txt = rhd[0].get_text("text")
+    rhd.close()
+    assert "Python for Data Science" in rh_txt and "C Essentials 1" in rh_txt and "Excel Associate" in rh_txt
+
+    # 4. Completeness block exposes structured missing_blocks in 422 response
+    from unittest.mock import patch
+
+    reg = client.post(
+        "/api/v1/auth/register",
+        json={"email": "r6user@example.com", "password": "StrongPassword123!", "full_name": "R6 User"},
+    )
+    assert reg.status_code == 201
+    headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
+    user = db_session.query(User).filter(User.email == "r6user@example.com").first()
+    pdf_bytes = MANINDRA_PDF.read_bytes()
+    resume_row = ResumeFile(
+        user_id=user.id,
+        filename="manindra_resume.pdf",
+        file_type="pdf",
+        file_size=len(pdf_bytes),
+        storage_path=str(MANINDRA_PDF),
+        file_bytes=pdf_bytes,
+        layout_type="pdf",
+        page_count=1,
+        parsed_structure=parsed.model_dump(mode="json"),
+        element_map=elem_map,
+        raw_text=raw_text,
+    )
+    job_row = JobPosting(
+        user_id=user.id,
+        title="Software Engineer Intern",
+        company="PayPal",
+        raw_text="JavaScript React Node.js C++ REST APIs",
+        required_skills=list(job.required_skills),
+        preferred_skills=list(job.preferred_skills),
+        responsibilities=list(job.responsibilities),
+        keywords=list(job.keywords),
+    )
+    db_session.add_all([resume_row, job_row])
+    db_session.flush()
+    app_row = Application(
+        user_id=user.id,
+        resume_file_id=resume_row.id,
+        job_posting_id=job_row.id,
+        status="Draft",
+        compatibility_before=75.0,
+    )
+    db_session.add(app_row)
+    db_session.flush()
+    ver = ResumeVersion(application_id=app_row.id, version_number=1, page_count_original=1)
+    db_session.add(ver)
+    db_session.commit()
+
+    with patch(
+        "app.api.applications.verify_exported_pdf_completeness",
+        return_value=(
+            False,
+            ["Completeness check failed: original content missing without accepted removal ('IBM - Python for Data Science')."],
+        ),
+    ):
+        comp_blk_res = client.post(f"/api/v1/applications/{app_row.id}/versions/{ver.id}/export", headers=headers)
+    assert comp_blk_res.status_code == 422, comp_blk_res.text
+    det_c = comp_blk_res.json()["detail"]
+    missing_list = det_c.get("missing_blocks") or (det_c.get("page_fit") or {}).get("missing_blocks") or []
+    assert any("IBM" in str(m) for m in missing_list), det_c
+
+
+def test_round7_typos_evidence_summary_docx_and_multiformat_regression(tmp_path: Path, db_session) -> None:
+    """
+    Round 7 verification & multi-format regression suite:
+      1. Pending Custom GPT typos ('casual masking'->'causal masking', 'constrains'->'constraints') apply cleanly in PDF & DOCX.
+      2. Decision-IQ uses only verified repo evidence (no hallucinated Node.js) and shows per-technology evidence.
+      3. Programming Languages keeps canonical 'C, C++, Java, Python' without unnecessary reordering.
+      4. Summary attributes internship + academic projects + hackathons, drops generic filler, and keeps AI/LLM toggle.
+      5. Exported PDF and DOCX match (1 page PDF, working links, overlaps=0, completeness=True, Currently Learning inside Skills).
+      6. Multi-resume + multi-job regression across Word DOCX, single-col PDF, two-col sidebar PDF, and 2 job URLs.
+    """
+    from unittest.mock import MagicMock, patch
+    import fitz
+    from docx import Document
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+
+    from app.models.user import User
+    from app.schemas.github import AnalyzedRepo, RepoEvidenceSignals
+    from app.services.generation.optimizer import generate_tailored_changes
+    from app.services.github.scorer import build_factual_repo_bullets_with_evidence, rank_repos_for_job
+    from app.services.jobs.extractor import extract_job_from_url
+    from app.services.resume.docx_editor import (
+        _iter_all_paragraphs,
+        apply_changes_to_docx_in_place,
+        build_ats_docx_from_structure,
+    )
+    from app.services.resume.docx_parser import parse_docx_resume
+    from app.services.resume.pdf_editor import apply_changes_to_pdf_in_place
+    from app.services.resume.theme_verifier import verify_exported_pdf_completeness
+
+    parsed, elem_map, raw_text, _ = parse_pdf_resume(MANINDRA_PDF)
+    job = _load_paypal_job()
+
+    # 1 & 2. Decision-IQ evidence-only tech selection (prose "node canvas" must NOT trigger Node.js) + per-tech evidence
+    diq_repo = AnalyzedRepo(
+        name="Decision-IQ",
+        full_name="Manindra-babu/Decision-IQ",
+        html_url="https://github.com/Manindra-babu/Decision-IQ",
+        description="Interactive AI-powered roadmap generator and decision intelligence platform featuring dynamic node canvas graphs",
+        primary_language="JavaScript",
+        languages={"JavaScript": 6200, "Python": 3400, "CSS": 900},
+        dependencies=["react", "fastapi", "uvicorn"],
+        inferred_skills=["React", "FastAPI", "Python", "JavaScript", "HTML"],
+        readme_excerpt="Interactive AI-powered roadmap generator with React Flow canvas and FastAPI backend services.",
+        signals=RepoEvidenceSignals(
+            has_readme=True, file_count=39, total_commits=15, user_commits=15, user_commit_share=1.0, has_tests=True
+        ),
+    )
+    b_diq, ev_diq = build_factual_repo_bullets_with_evidence(diq_repo)
+    assert "node.js" not in b_diq[0].lower(), f"Hallucinated Node.js in Decision-IQ: {b_diq}"
+    for req_tech in ("React", "FastAPI", "Python", "JavaScript"):
+        assert req_tech.lower() in b_diq[0].lower(), b_diq
+        assert f"{req_tech.lower()}:" in ev_diq[0].detail.lower(), ev_diq[0].detail
+
+    recs = rank_repos_for_job([diq_repo], job_skills=job.required_skills, job_keywords=job.keywords, resume_text=raw_text)
+    for r in recs:
+        r.decision = "approved"
+
+    changes_no_ai = generate_tailored_changes(
+        resume=parsed,
+        raw_resume_text=raw_text,
+        element_map=elem_map,
+        job=job,
+        github_repos=[diq_repo],
+        approved_github_recs=recs,
+        confirmed_learning=[{"skill": "AJAX"}, {"skill": "Web Services"}, {"skill": "SOA"}],
+        keep_ai_interest=False,
+    )
+    changes_with_ai = generate_tailored_changes(
+        resume=parsed,
+        raw_resume_text=raw_text,
+        element_map=elem_map,
+        job=job,
+        github_repos=[diq_repo],
+        approved_github_recs=recs,
+        keep_ai_interest=True,
+    )
+
+    # Custom GPT typos are pending
+    casual_ch = next((c for c in changes_no_ai if "casual masking" in (c.get("original_text") or "").lower()), None)
+    constrains_ch = next((c for c in changes_no_ai if "constrains" in (c.get("original_text") or "").lower()), None)
+    assert casual_ch is not None and casual_ch["status"] == "pending" and "causal masking" in casual_ch["new_text"].lower()
+    assert constrains_ch is not None and constrains_ch["status"] == "pending" and "constraints" in constrains_ch["new_text"].lower()
+
+    # 3. Skills restore C, C++, Java, Python (no reorder change emitted for Programming Languages)
+    prog_lang_ch = [
+        c for c in changes_no_ai if c.get("section") == "skills" and "Programming Languages:" in (c.get("new_text") or "")
+    ]
+    assert prog_lang_ch == [], prog_lang_ch
+
+    # 4. Summary attribution + no generic filler + toggleable AI/LLM interest
+    sum_no_ai = next(c for c in changes_no_ai if c.get("section") == "summary" and len(c.get("new_text") or "") > 40)
+    sum_with_ai = next(c for c in changes_with_ai if c.get("section") == "summary" and len(c.get("new_text") or "") > 40)
+    assert "through an internship, academic projects, and hackathons" in sum_no_ai["new_text"]
+    assert "Demonstrates strong problem-solving" not in sum_no_ai["new_text"]
+    assert "Artificial Intelligence" not in sum_no_ai["new_text"]
+    assert "Artificial Intelligence" in sum_with_ai["new_text"]
+    assert "Artificial Intelligence" in str((sum_no_ai.get("target_location") or {}).get("alt_with_ai_interest") or "")
+
+    # 5. Export PDF + DOCX verification (links, page count, completeness, overlaps, C/C++ preserved)
+    approved = []
+    for c in changes_no_ai:
+        if c.get("change_type") == "relevance_trim":
+            continue
+        cc = dict(c)
+        if (cc.get("target_location") or {}).get("requires_confirmation"):
+            cc["status"] = "edited"
+            cc["edited_text"] = cc["target_location"]["without_mongodb"]
+        else:
+            cc["status"] = "accepted"
+        approved.append(cc)
+
+    out_pdf = tmp_path / "r7_manindra.pdf"
+    out_docx = tmp_path / "r7_manindra.docx"
+    pdf_res = apply_changes_to_pdf_in_place(
+        source_pdf_path=MANINDRA_PDF,
+        output_pdf_path=out_pdf,
+        approved_changes=approved,
+        resume_structure=parsed,
+    )
+    assert pdf_res.page_count_output == 1
+    assert pdf_res.overlap_passed is True, pdf_res.overlap_details
+    assert (pdf_res.page_fit or {}).get("passed") is True, pdf_res.page_fit
+    comp_ok, comp_errs = verify_exported_pdf_completeness(
+        original_pdf_path=MANINDRA_PDF,
+        output_pdf_path=out_pdf,
+        applied_changes=approved,
+    )
+    assert comp_ok, comp_errs
+
+    pd = fitz.open(str(out_pdf))
+    ptxt = pd[0].get_text("text")
+    puris = {str(lk.get("uri") or "") for lk in (pd[0].get_links() or [])}
+    pd.close()
+    assert "https://github.com/Manindra-babu/Decision-IQ" in puris
+    assert "causal masking" in ptxt and "constraints" in ptxt
+    assert "C, C++, Java, Python" in ptxt
+
+    build_ats_docx_from_structure(
+        structure=parsed,
+        approved_changes=approved,
+        output_docx_path=out_docx,
+        style_tokens=elem_map.get("style_tokens"),
+    )
+    dx = Document(str(out_docx))
+    dx_txt = "\n".join(p.text for p in _iter_all_paragraphs(dx))
+    dx_uris = {r.target_ref for r in dx.part.rels.values() if r.reltype == RT.HYPERLINK}
+    assert "https://github.com/Manindra-babu/Decision-IQ" in dx_uris
+    assert "causal masking" in dx_txt and "constraints" in dx_txt
+    assert "C, C++, Java, Python" in dx_txt
+    assert "Currently Learning: AJAX, Web Services, SOA" in dx_txt
+    assert "through an internship, academic projects, and hackathons" in dx_txt
+    assert "Demonstrates strong problem-solving" not in dx_txt
+
+    # Word DOCX in-place editing parity on manindra_resume.docx
+    manindra_docx = MANINDRA_PDF.parent / "manindra_resume.docx"
+    st_dx, el_dx, raw_dx, _, _, _ = parse_docx_resume(manindra_docx)
+    chg_dx = generate_tailored_changes(
+        resume=st_dx,
+        raw_resume_text=raw_dx,
+        element_map=el_dx,
+        job=job,
+        github_repos=[diq_repo],
+        approved_github_recs=recs,
+        confirmed_learning=[{"skill": "AJAX"}],
+    )
+    app_dx = [dict(c, status="accepted") for c in chg_dx if c.get("change_type") != "relevance_trim"]
+    out_in_dx = tmp_path / "r7_inplace.docx"
+    dx_warns = apply_changes_to_docx_in_place(
+        source_docx_path=manindra_docx,
+        output_docx_path=out_in_dx,
+        approved_changes=app_dx,
+    )
+    assert dx_warns == [], dx_warns
+    dx2 = Document(str(out_in_dx))
+    dx2_txt = "\n".join(p.text for p in _iter_all_paragraphs(dx2))
+    dx2_uris = {r.target_ref for r in dx2.part.rels.values() if r.reltype == RT.HYPERLINK}
+    assert "causal masking" in dx2_txt and "constraints" in dx2_txt
+    assert "https://github.com/Manindra-babu/Decision-IQ" in dx2_uris
+
+    # 6. Multi-resume x Multi-job regression using 3 other resumes + 2 job URLs
+    jobs_dir = MANINDRA_PDF.parent.parent / "jobs"
+    url_fixtures = {
+        "https://boards.greenhouse.io/stripe/jobs/4918201": (jobs_dir / "greenhouse_job.html").read_text(encoding="utf-8"),
+        "https://jobs.lever.co/notion/8c3e12f4": (jobs_dir / "lever_job.html").read_text(encoding="utf-8"),
+    }
+
+    from app.services.llm.demo_client import DemoLLMClient
+    user_r7 = User(email="r7@example.com", hashed_password="x", full_name="R7")
+    db_session.add(user_r7)
+    db_session.commit()
+
+    extracted_jobs = []
+    for j_url, html_body in url_fixtures.items():
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = html_body
+        mock_resp.raise_for_status = MagicMock()
+        with (
+            patch("app.services.jobs.extractor.validate_public_url"),
+            patch("app.services.jobs.extractor._check_robots_allowed", return_value=True),
+            patch("app.services.jobs.extractor.httpx.get", return_value=mock_resp),
+            patch("app.services.jobs.extractor.get_llm_client_for_user", return_value=DemoLLMClient()),
+        ):
+            jp = extract_job_from_url(j_url, db=db_session, user=user_r7)
+        from app.schemas.job import StructuredJobFields
+        extracted_jobs.append(
+            (
+                j_url,
+                StructuredJobFields(
+                    title=jp.title,
+                    company=jp.company,
+                    required_skills=list(jp.required_skills),
+                    preferred_skills=list(jp.preferred_skills),
+                    responsibilities=list(jp.responsibilities),
+                    keywords=list(jp.keywords),
+                ),
+            )
+        )
+
+    sample_repo = AnalyzedRepo(
+        name="API-Gateway-Demo",
+        full_name="testuser/API-Gateway-Demo",
+        html_url="https://github.com/testuser/API-Gateway-Demo",
+        description="High-throughput REST API gateway built with Python and FastAPI",
+        primary_language="Python",
+        languages={"Python": 8000, "TypeScript": 2000},
+        dependencies=["fastapi", "uvicorn", "redis", "pytest"],
+        inferred_skills=["Python", "FastAPI", "Redis", "Docker"],
+        readme_excerpt="FastAPI gateway service with Redis rate limiting and PostgreSQL persistence.",
+        signals=RepoEvidenceSignals(
+            has_readme=True, file_count=18, total_commits=14, user_commits=14, user_commit_share=1.0, has_tests=True
+        ),
+    )
+
+    single_pdf = MANINDRA_PDF.parent / "sample_resume.pdf"
+    two_col_pdf = MANINDRA_PDF.parent / "sample_two_column.pdf"
+    assert single_pdf.exists() and two_col_pdf.exists() and manindra_docx.exists()
+
+    # Single-column PDF + Word DOCX must export cleanly across both job URLs
+    for j_url, j_fields in extracted_jobs:
+        # 1) Single-column PDF
+        sp_st, sp_el, sp_raw, _ = parse_pdf_resume(single_pdf)
+        sp_recs = rank_repos_for_job([sample_repo], job_skills=j_fields.required_skills, job_keywords=j_fields.keywords, resume_text=sp_raw)
+        for r in sp_recs:
+            r.decision = "approved"
+        sp_chg = generate_tailored_changes(
+            resume=sp_st, raw_resume_text=sp_raw, element_map=sp_el, job=j_fields,
+            github_repos=[sample_repo], approved_github_recs=sp_recs,
+        )
+        sp_app = [dict(c, status="accepted") for c in sp_chg if c.get("change_type") != "relevance_trim"]
+        sp_out = tmp_path / f"single_{len(sp_app)}_{abs(hash(j_url)) % 9999}.pdf"
+        sp_res = apply_changes_to_pdf_in_place(
+            source_pdf_path=single_pdf, output_pdf_path=sp_out, approved_changes=sp_app, resume_structure=sp_st
+        )
+        assert sp_res.page_count_output == 1, (j_url, sp_res.page_fit)
+        assert sp_res.overlap_passed is True, (j_url, sp_res.overlap_details)
+        ok_sp, errs_sp = verify_exported_pdf_completeness(
+            original_pdf_path=single_pdf, output_pdf_path=sp_out, applied_changes=sp_app
+        )
+        assert ok_sp, (j_url, errs_sp)
+
+        # 2) Word DOCX
+        dx_recs = rank_repos_for_job([sample_repo], job_skills=j_fields.required_skills, job_keywords=j_fields.keywords, resume_text=raw_dx)
+        for r in dx_recs:
+            r.decision = "approved"
+        dx_c = generate_tailored_changes(
+            resume=st_dx, raw_resume_text=raw_dx, element_map=el_dx, job=j_fields,
+            github_repos=[sample_repo], approved_github_recs=dx_recs,
+        )
+        dx_a = [dict(c, status="accepted") for c in dx_c if c.get("change_type") != "relevance_trim"]
+        dx_out = tmp_path / f"word_{abs(hash(j_url)) % 9999}.docx"
+        assert apply_changes_to_docx_in_place(source_docx_path=manindra_docx, output_docx_path=dx_out, approved_changes=dx_a) == []
+
+    # 3) Two-column vertical-sidebar PDF: verify completeness/overlaps & document column-divider boundary limitation
+    tc_st, tc_el, tc_raw, _ = parse_pdf_resume(two_col_pdf)
+    tc_recs = rank_repos_for_job([sample_repo], job_skills=extracted_jobs[0][1].required_skills, job_keywords=extracted_jobs[0][1].keywords, resume_text=tc_raw)
+    for r in tc_recs:
+        r.decision = "approved"
+    tc_chg = generate_tailored_changes(
+        resume=tc_st, raw_resume_text=tc_raw, element_map=tc_el, job=extracted_jobs[0][1],
+        github_repos=[sample_repo], approved_github_recs=tc_recs,
+    )
+    tc_app = [dict(c, status="accepted") for c in tc_chg if c.get("change_type") != "relevance_trim"]
+    tc_out = tmp_path / "two_col_out.pdf"
+    tc_res = apply_changes_to_pdf_in_place(
+        source_pdf_path=two_col_pdf, output_pdf_path=tc_out, approved_changes=tc_app, resume_structure=tc_st
+    )
+    assert tc_res.page_count_output == 1
+    assert tc_res.overlap_passed is True, tc_res.overlap_details
+    tc_ok, tc_errs = verify_exported_pdf_completeness(
+        original_pdf_path=two_col_pdf, output_pdf_path=tc_out, applied_changes=tc_app
+    )
+    assert tc_ok, tc_errs

@@ -1,0 +1,42 @@
+{
+  "skills": [
+    "Python",
+    "JavaScript",
+    "TypeScript",
+    "C/C++",
+    "SQL",
+    "HTML5",
+    "CSS",
+    "React",
+    "Node.js",
+    "Express.js",
+    "MongoDB",
+    "Git",
+    "GitHub",
+    "VS Code",
+    "Postman",
+    "Linux",
+    "Firebase",
+    "Vercel"
+  ],
+  "confirmed_learning": [
+    {
+      "skill": "AJAX",
+      "status": "learned",
+      "note": "Enterprise web apps",
+      "confirmed_date": "2026-11-15"
+    },
+    {
+      "skill": "Web Services",
+      "status": "learned",
+      "note": "RESTful services",
+      "confirmed_date": "2026-11-15"
+    },
+    {
+      "skill": "SOA",
+      "status": "learned",
+      "note": "Service-oriented architecture",
+      "confirmed_date": "2026-11-15"
+    }
+  ]
+}

@@ -388,6 +388,9 @@ def generate_repo_bullets_with_evidence(
             raise
         return fallback_bullets, fallback_evidence
 
+    from app.services.github.scorer import _detect_frontend_label
+
+    frontend_hint = _detect_frontend_label(repo) or "None detected"
     test_files_hint = ", ".join(repo.test_files[:6]) if repo.test_files else "None"
     commit_hint = "; ".join(repo.commit_messages[:5]) if repo.commit_messages else "None"
     prompt = (
@@ -396,10 +399,13 @@ def generate_repo_bullets_with_evidence(
         "1. Use ONLY facts directly supported by the README, dependencies, key files, commit messages, and test files below.\n"
         "2. Do NOT mention repository file counts (never write 'across N files'), bare language lists, or invented metrics/user counts.\n"
         "3. Never write generic filler like 'Added automated test coverage to verify core module behavior.'\n"
-        "4. Only mention tests if Test files != None, and name specifically what modules/features the test files cover.\n"
-        "5. Populate `items` with `{bullet, evidence_source}` citing the concrete evidence (e.g. 'README + package.json', 'Commit history', 'tests/test_slides.py').\n\n"
+        "4. Each bullet MUST be a complete, grammatical sentence under 155 characters with proper articles ('a'/'an') and natural conjunctions (never slash lists like 'FastAPI / JavaScript').\n"
+        "5. If Frontend detected != None detected, explicitly mention the frontend technology in bullet 1.\n"
+        "6. Only mention tests if Test files != None, and name specifically what modules/features the test files cover.\n"
+        "7. Populate `items` with `{bullet, evidence_source}` citing the concrete evidence (e.g. 'README + package.json', 'Commit history', 'tests/test_slides.py').\n\n"
         f"Project: {repo.name}\n"
         f"Description: {repo.description}\n"
+        f"Frontend detected: {frontend_hint}\n"
         f"Dependencies / key stack: {', '.join(repo.dependencies[:12]) or ', '.join(repo.inferred_skills[:6])}\n"
         f"Key files: {', '.join(repo.key_files[:12])}\n"
         f"Test files: {test_files_hint}\n"

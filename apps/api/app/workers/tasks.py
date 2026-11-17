@@ -146,6 +146,7 @@ def run_github_confirm_job(job_id: str, db: Session | None = None) -> dict[str, 
                 rec = RepoRecommendation.model_validate(raw_rec)
                 if rec.repo_name in confirmed_set:
                     rec.decision = "approved"
+                    rec.omitted_for_space = False
                     analyzed_repo = repos_by_name.get(rec.repo_name) or _minimal_analyzed_repo(rec)
                     bullets, bullet_evidence = generate_repo_bullets_with_evidence(
                         analyzed_repo,

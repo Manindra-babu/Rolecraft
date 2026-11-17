@@ -2,9 +2,11 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
+from typing import Any, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, require_valid_gemini_key
@@ -33,13 +35,20 @@ from app.schemas.application import (
     ConfirmGitHubProjectsRequest,
     GitHubConfirmJobResponse,
     GitHubDecisionsRequest,
+    PageFitOptionApplyRequest,
     ResumeVersionResponse,
+    SourceVerificationDecisionRequest,
 )
 from app.schemas.github import AnalyzedRepo, RepoRecommendation
 from app.schemas.job import StructuredJobFields
 from app.schemas.matching import CompatibilityBreakdown, LearningPlanDetail, SkillAssessmentItem
 from app.schemas.resume import ParsedResumeStructure
-from app.services.generation.optimizer import generate_tailored_changes
+from app.services.generation.optimizer import (
+    check_section_item_loss_guard,
+    generate_tailored_changes,
+)
+from app.services.generation.relevance import score_resume_relevance
+from app.services.generation.source_verifier import SourceVerifier
 from app.services.generation.validator import validate_claim_against_evidence
 from app.services.github.client import analyze_github_profile
 from app.services.github.scorer import rank_repos_for_job
@@ -54,6 +63,8 @@ from app.services.resume.docx_editor import (
 from app.services.resume.pdf_editor import (
     EXPORT_CODE_VERSION,
     PdfEditResult,
+    _condense_education_bullet,
+    _shorten_project_card_text,
     apply_changes_to_pdf_in_place,
 )
 from app.services.resume.theme_verifier import (
@@ -156,9 +167,31 @@ def _to_version_response(v: ResumeVersion) -> ResumeVersionResponse:
         theme_warnings=list(v.theme_warnings or []) if (fresh or v.export_blocked) else [],
         export_blocked=bool(v.export_blocked),
         export_cache_key=v.export_cache_key if fresh else None,
+        overlap_passed=v.overlap_passed if (fresh or v.export_blocked) else None,
+        overlap_details=list(v.overlap_details or []) if (fresh or v.export_blocked) else [],
+        page_fit=dict(v.page_fit or {}) if (fresh or v.export_blocked) else None,
+        source_verification=dict(v.source_verification or {}) if getattr(v, "source_verification", None) else None,
         changes=[ChangeResponse.model_validate(c) for c in v.changes],
         created_at=v.created_at,
     )
+
+
+def _compute_app_relevance(resume: ResumeFile | None, job: JobPosting | None) -> list[dict]:
+    if not resume or not job:
+        return []
+    parsed = ParsedResumeStructure.model_validate(resume.parsed_structure or {})
+    job_fields = StructuredJobFields(
+        title=job.title,
+        company=job.company,
+        location=job.location,
+        experience_level=job.experience_level,
+        responsibilities=list(job.responsibilities or []),
+        required_skills=list(job.required_skills or []),
+        preferred_skills=list(job.preferred_skills or []),
+        or_groups=list(job.or_groups or []),
+        keywords=list(job.keywords or []),
+    )
+    return score_resume_relevance(resume=parsed, job=job_fields)
 
 
 def _to_detail_response(db: Session, app_row: Application) -> ApplicationDetailResponse:
@@ -233,6 +266,8 @@ def _to_detail_response(db: Session, app_row: Application) -> ApplicationDetailR
             RepoRecommendation.model_validate(r) for r in (app_row.github_recommendations or [])
         ],
         learning_plans=plan_details,
+        confirmed_learning=list(app_row.confirmed_learning or []),
+        relevance_review=_compute_app_relevance(resume, job),
         versions=[_to_version_response(v) for v in versions],
         created_at=app_row.created_at,
         updated_at=app_row.updated_at,
@@ -383,6 +418,9 @@ def create_application(
         else []
     )
 
+    prof = db.query(MasterProfile).filter(MasterProfile.user_id == current_user.id).first()
+    prof_confirmed = list(prof.confirmed_learning or []) if prof else []
+
     app_row = Application(
         user_id=current_user.id,
         resume_file_id=resume.id,
@@ -394,6 +432,7 @@ def create_application(
         compatibility_after=breakdown_full.overall_score,
         score_breakdown=breakdown_full.model_dump(mode="json"),
         github_recommendations=[r.model_dump(mode="json") for r in recs],
+        confirmed_learning=prof_confirmed,
     )
     db.add(app_row)
     db.flush()
@@ -409,7 +448,14 @@ def create_application(
                 confidence=item.confidence,
             )
         )
-        if item.category in {"needs_development", "missing"}:
+        if item.category in {"needs_development", "missing", "under_represented"}:
+            # Skip Web Technologies that already have MERN/REST experience evidence
+            if item.category == "under_represented" and (
+                "inferred from" in (item.evidence_summary or "").lower()
+                or "mern" in (item.evidence_summary or "").lower()
+                or "experience" in (item.evidence_summary or "").lower()
+            ):
+                continue
             plan_detail = build_learning_plan(
                 skill_name=item.skill_name,
                 category=item.category,
@@ -492,6 +538,56 @@ def update_github_decisions(
             rec_copy["decision"] = decision_map[rec_copy["repo_name"]]
         updated.append(rec_copy)
     app_row.github_recommendations = updated
+    db.add(app_row)
+    db.commit()
+    db.refresh(app_row)
+    return _to_detail_response(db, app_row)
+
+
+class ConfirmAppLearningRequest(BaseModel):
+    skills: list[str] = Field(default_factory=list)
+    note: Optional[str] = None
+
+
+@router.post("/{app_id}/learning-confirm", response_model=ApplicationDetailResponse)
+def confirm_application_learning(
+    app_id: str,
+    payload: ConfirmAppLearningRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ApplicationDetailResponse:
+    app_row = (
+        db.query(Application)
+        .filter(Application.id == app_id, Application.user_id == current_user.id)
+        .first()
+    )
+    if not app_row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Application not found.")
+    current_list = list(app_row.confirmed_learning or [])
+    seen = {item.get("skill", "").lower() for item in current_list}
+    for sk in payload.skills:
+        clean = sk.strip()
+        if clean and clean.lower() not in seen:
+            current_list.append({"skill": clean, "note": payload.note or ""})
+            seen.add(clean.lower())
+    app_row.confirmed_learning = current_list
+    profile = db.query(MasterProfile).filter(MasterProfile.user_id == current_user.id).first()
+    if profile:
+        prof_list = list(profile.confirmed_learning or [])
+        prof_seen = {item.get("skill", "").lower() for item in prof_list}
+        for sk in payload.skills:
+            clean = sk.strip()
+            if clean and clean.lower() not in prof_seen:
+                prof_list.append({"skill": clean, "status": "learned", "note": payload.note or "Confirmed by user", "label": clean})
+                prof_seen.add(clean.lower())
+        profile.confirmed_learning = prof_list
+        cur_skills = list(profile.skills or [])
+        for sk in payload.skills:
+            clean = sk.strip()
+            if clean and clean not in cur_skills:
+                cur_skills.append(clean)
+        profile.skills = cur_skills
+        db.add(profile)
     db.add(app_row)
     db.commit()
     db.refresh(app_row)
@@ -623,6 +719,7 @@ def get_github_confirm_job_status(
 @router.post("/{app_id}/generate", response_model=ApplicationDetailResponse)
 def generate_resume_version(
     app_id: str,
+    keep_ai_interest: bool = False,
     current_user: User = Depends(require_valid_gemini_key),
     db: Session = Depends(get_db),
 ) -> ApplicationDetailResponse:
@@ -646,8 +743,23 @@ def generate_resume_version(
         if gh:
             gh_repos = [AnalyzedRepo.model_validate(r) for r in gh.repos_data]
 
-    profile = db.query(MasterProfile).filter(MasterProfile.user_id == current_user.id).first()
-    confirmed_learning = list(profile.confirmed_learning or []) if profile else []
+    prof = db.query(MasterProfile).filter(MasterProfile.user_id == current_user.id).first()
+    prof_confirmed = list(prof.confirmed_learning or []) if prof else []
+    app_confirmed = list(app_row.confirmed_learning or [])
+    seen_skills = set()
+    merged_confirmed = []
+    for item in app_confirmed + prof_confirmed:
+        sk = str(item.get("skill") or item.get("label") or "").strip().lower()
+        if sk and sk not in seen_skills:
+            seen_skills.add(sk)
+            merged_confirmed.append(item)
+    if prof and prof.skills:
+        for sk in prof.skills:
+            clean = sk.strip()
+            if clean and clean.lower() not in seen_skills:
+                seen_skills.add(clean.lower())
+                merged_confirmed.append({"skill": clean, "status": "learned", "source": "master profile", "label": clean})
+    confirmed_learning = merged_confirmed
 
     parsed_resume = ParsedResumeStructure.model_validate(resume.parsed_structure)
     job_fields = StructuredJobFields(
@@ -664,6 +776,7 @@ def generate_resume_version(
     recs = [RepoRecommendation.model_validate(r) for r in (app_row.github_recommendations or [])]
     llm = get_llm_client_for_user(db, current_user)
 
+    rel_items = _compute_app_relevance(resume, job)
     proposed_changes = generate_tailored_changes(
         resume=parsed_resume,
         raw_resume_text=resume.raw_text,
@@ -673,13 +786,32 @@ def generate_resume_version(
         approved_github_recs=recs,
         confirmed_learning=confirmed_learning,
         llm=llm,
+        keep_ai_interest=keep_ai_interest,
+        relevance_items=rel_items,
     )
 
     next_ver_num = max((v.version_number for v in app_row.versions), default=0) + 1
+    guard_warnings = check_section_item_loss_guard(resume=parsed_resume, changes=proposed_changes)
+
+    # Source Verification step: prove every claim comes from real data
+    source_p = Path(resume.storage_path) if resume.storage_path else Path("resume.pdf")
+    verifier = SourceVerifier(original_resume_path=source_p)
+    sv_report = verifier.verify(
+        tailored_resume=parsed_resume,
+        original_resume=parsed_resume,
+        approved_changes=proposed_changes,
+        github_repos=gh_repos,
+        master_profile={"confirmed_learning": confirmed_learning},
+        job=job_fields,
+        approved_recs=recs,
+    )
+
     version = ResumeVersion(
         application_id=app_row.id,
         version_number=next_ver_num,
         page_count_original=resume.page_count,
+        theme_warnings=guard_warnings + sv_report.blocking_reasons,
+        source_verification=sv_report.model_dump(),
     )
     db.add(version)
     db.flush()
@@ -716,6 +848,41 @@ def update_change_decision(
     )
     if not change:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Change not found.")
+
+    loc = dict(change.target_location or {})
+    if (
+        payload.status in {"accepted", "edited"}
+        and loc.get("requires_confirmation")
+        and not loc.get("accuracy_confirmed")
+        and payload.accuracy_confirmed is None
+        and payload.edited_text is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=loc.get("accuracy_prompt") or "Accuracy confirmation is required before accepting this change.",
+        )
+
+    if payload.accuracy_confirmed is True:
+        loc["accuracy_confirmed"] = True
+        change.target_location = loc
+        if change.validation_status == "flagged":
+            change.validation_status = "passed"
+        change.validation_warnings = []
+    elif payload.accuracy_confirmed is False:
+        loc["accuracy_confirmed"] = True
+        change.target_location = loc
+        if loc.get("without_mongodb") and payload.status in {"accepted", "edited"}:
+            change.edited_text = str(loc["without_mongodb"])
+            change.validation_status = "passed"
+            change.validation_warnings = []
+            change.status = "edited"
+            db.add(change)
+            if change.resume_version:
+                _clear_version_export_cache(change.resume_version)
+                db.add(change.resume_version)
+            db.commit()
+            db.refresh(change)
+            return change
 
     if payload.status == "accepted" and change.validation_status == "blocked":
         raise HTTPException(
@@ -794,11 +961,165 @@ def bulk_accept_low_risk_changes(
     return _to_version_response(version)
 
 
+@router.get("/{app_id}/versions/{version_id}/source-verification")
+def get_source_verification_report_endpoint(
+    app_id: str,
+    version_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    app_row = (
+        db.query(Application)
+        .filter(Application.id == app_id, Application.user_id == current_user.id)
+        .first()
+    )
+    if not app_row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Application not found.")
+    version = (
+        db.query(ResumeVersion)
+        .filter(ResumeVersion.id == version_id, ResumeVersion.application_id == app_id)
+        .first()
+    )
+    if not version:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resume version not found.")
+
+    resume = db.query(ResumeFile).filter(ResumeFile.id == app_row.resume_file_id).first()
+    gh_repos: list[AnalyzedRepo] = []
+    if app_row.github_analysis_id:
+        gh = db.query(GitHubAnalysis).filter(GitHubAnalysis.id == app_row.github_analysis_id).first()
+        if gh:
+            gh_repos = [AnalyzedRepo.model_validate(r) for r in gh.repos_data]
+
+    prof = db.query(MasterProfile).filter(MasterProfile.user_id == current_user.id).first()
+    confirmed_learning = list(prof.confirmed_learning or []) if prof else []
+
+    parsed = ParsedResumeStructure.model_validate(resume.parsed_structure or {}) if resume else ParsedResumeStructure()
+    source_path = Path(resume.storage_path) if resume and resume.storage_path else Path("source_resume.pdf")
+
+    verifier = SourceVerifier(original_resume_path=source_path)
+    sv_report = verifier.verify(
+        tailored_resume=parsed,
+        original_resume=parsed,
+        approved_changes=version.changes,
+        github_repos=gh_repos,
+        master_profile={"confirmed_learning": confirmed_learning},
+    )
+    version.source_verification = sv_report.model_dump()
+    db.add(version)
+    db.commit()
+    return sv_report.model_dump()
+
+
+@router.post("/{app_id}/versions/{version_id}/source-decision")
+def update_source_decision_endpoint(
+    app_id: str,
+    version_id: str,
+    payload: SourceVerificationDecisionRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    import re
+    app_row = (
+        db.query(Application)
+        .filter(Application.id == app_id, Application.user_id == current_user.id)
+        .first()
+    )
+    if not app_row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Application not found.")
+    version = (
+        db.query(ResumeVersion)
+        .filter(ResumeVersion.id == version_id, ResumeVersion.application_id == app_id)
+        .first()
+    )
+    if not version:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resume version not found.")
+
+    item_name = payload.item.strip()
+    decision = payload.decision.strip().lower()
+
+    prof = db.query(MasterProfile).filter(MasterProfile.user_id == current_user.id).first()
+    if not prof:
+        prof = MasterProfile(user_id=current_user.id)
+        db.add(prof)
+        db.flush()
+
+    if decision == "keep":
+        # Save to MasterProfile confirmed learning
+        confirmed = list(prof.confirmed_learning or [])
+        if not any(str(c.get("skill", "")).lower() == item_name.lower() for c in confirmed):
+            confirmed.append({
+                "skill": item_name,
+                "status": "learned",
+                "note": "Confirmed by user in Source Verification",
+                "confirmed_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            })
+            prof.confirmed_learning = confirmed
+        skills = list(prof.skills or [])
+        if item_name not in skills:
+            skills.append(item_name)
+            prof.skills = skills
+        db.add(prof)
+
+        # Also add to app_row confirmed learning
+        app_conf = list(app_row.confirmed_learning or [])
+        if not any(str(c.get("skill", "")).lower() == item_name.lower() for c in app_conf):
+            app_conf.append({
+                "skill": item_name,
+                "status": "learned",
+                "note": "Confirmed by user in Source Verification",
+                "confirmed_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            })
+            app_row.confirmed_learning = app_conf
+        db.add(app_row)
+    elif decision == "remove":
+        # Remove from changes or unaccept change introducing this item
+        for ch in version.changes:
+            txt = ch.new_text or ch.edited_text or ""
+            if item_name.lower() in txt.lower():
+                if ch.section == "skills":
+                    updated_line = re.sub(rf",\s*{re.escape(item_name)}\b", "", txt, flags=re.I)
+                    updated_line = re.sub(rf"\b{re.escape(item_name)}\s*,\s*", "", updated_line, flags=re.I)
+                    updated_line = re.sub(rf"\b{re.escape(item_name)}\b", "", updated_line, flags=re.I)
+                    ch.edited_text = updated_line.strip()
+                    ch.status = "edited"
+                else:
+                    ch.status = "rejected"
+                db.add(ch)
+
+    _clear_version_export_cache(version)
+
+    resume = db.query(ResumeFile).filter(ResumeFile.id == app_row.resume_file_id).first()
+    gh_repos: list[AnalyzedRepo] = []
+    if app_row.github_analysis_id:
+        gh = db.query(GitHubAnalysis).filter(GitHubAnalysis.id == app_row.github_analysis_id).first()
+        if gh:
+            gh_repos = [AnalyzedRepo.model_validate(r) for r in gh.repos_data]
+
+    parsed = ParsedResumeStructure.model_validate(resume.parsed_structure or {}) if resume else ParsedResumeStructure()
+    source_path = Path(resume.storage_path) if resume and resume.storage_path else Path("source_resume.pdf")
+
+    verifier = SourceVerifier(original_resume_path=source_path)
+    sv_report = verifier.verify(
+        tailored_resume=parsed,
+        original_resume=parsed,
+        approved_changes=version.changes,
+        github_repos=gh_repos,
+        master_profile={"confirmed_learning": prof.confirmed_learning, "skills": prof.skills},
+    )
+    version.source_verification = sv_report.model_dump()
+    if sv_report.can_export:
+        version.export_blocked = False
+    db.add(version)
+    db.commit()
+    db.refresh(version)
+    return sv_report.model_dump()
+
+
 @router.post("/{app_id}/versions/{version_id}/export", response_model=ResumeVersionResponse)
 def export_resume_version(
     app_id: str,
     version_id: str,
-    tighten_spacing: bool = True,
+    tighten_spacing: bool = False,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ResumeVersionResponse:
@@ -836,7 +1157,9 @@ def export_resume_version(
             "validation_status": ch.validation_status,
         }
         for ch in version.changes
-        if ch.status in {"accepted", "edited"} and ch.validation_status != "blocked"
+        if ch.status in {"accepted", "edited"}
+        and ch.validation_status != "blocked"
+        and not (isinstance(ch.target_location, dict) and ch.target_location.get("requires_confirmation") and not ch.target_location.get("accuracy_confirmed"))
     ]
 
     cache_key = compute_export_cache_key(
@@ -885,6 +1208,48 @@ def export_resume_version(
     orig_png_bytes: bytes | None = None
     out_png_bytes: bytes | None = None
     pdf_res: PdfEditResult | None = None
+    overlap_passed: bool | None = None
+    overlap_details: list[dict] = []
+    page_fit: dict = {}
+    job_post = db.query(JobPosting).filter(JobPosting.id == app_row.job_posting_id).first()
+    rel_items_for_export = _compute_app_relevance(resume, job_post)
+
+    # Section guard check: compare tailored resume against original resume before exporting
+    guard_warnings = check_section_item_loss_guard(
+        resume=parsed,
+        changes=version.changes,
+    )
+    if guard_warnings:
+        theme_warnings.extend(guard_warnings)
+        if any("certifications" in w for w in guard_warnings):
+            export_blocked = True
+            theme_warnings.insert(0, "Export blocked by section guard: Certifications must NEVER be removed or trimmed automatically.")
+
+    # Source verification check: prove that every claim in the resume comes from real data
+    gh_repos_export: list[AnalyzedRepo] = []
+    if app_row.github_analysis_id:
+        gh_e = db.query(GitHubAnalysis).filter(GitHubAnalysis.id == app_row.github_analysis_id).first()
+        if gh_e:
+            gh_repos_export = [AnalyzedRepo.model_validate(r) for r in gh_e.repos_data]
+    prof_e = db.query(MasterProfile).filter(MasterProfile.user_id == current_user.id).first()
+    conf_learning_e = list(prof_e.confirmed_learning or []) if prof_e else []
+
+    verifier = SourceVerifier(original_resume_path=source_path)
+    sv_report = verifier.verify(
+        tailored_resume=parsed,
+        original_resume=parsed,
+        approved_changes=approved_changes,
+        github_repos=gh_repos_export,
+        master_profile={"confirmed_learning": conf_learning_e},
+    )
+    version.source_verification = sv_report.model_dump()
+    if not sv_report.can_export or sv_report.unsourced_count > 0:
+        export_blocked = True
+        unsourced_names = [it.item for it in sv_report.items if it.status == "UNSOURCED"]
+        theme_warnings.insert(
+            0,
+            f"Export blocked by Source Verification: {len(unsourced_names)} unsourced claim(s) found ({', '.join(unsourced_names)}). Keep or remove them in the Source Verification step before exporting."
+        )
 
     if resume.file_type == "docx" and source_path.exists():
         orig_pdf = out_dir / "_orig.pdf"
@@ -919,16 +1284,28 @@ def export_resume_version(
                 if verify.blocked_reason:
                     theme_warnings.insert(0, verify.blocked_reason)
     elif resume.file_type == "pdf" and source_path.exists():
-        # Strategy B: true in-place PyMuPDF edit + 2-column band-shifted GitHub placement
+        # Strategy B: true in-place PyMuPDF edit + band-shifted placement
+        num_added_projects = sum(
+            1
+            for ch in approved_changes
+            if ch.get("change_type") == "added_from_github"
+            or (ch.get("section") == "projects" and not ch.get("original_text"))
+        )
+        effective_tighten = tighten_spacing
+
         pdf_res = apply_changes_to_pdf_in_place(
             source_pdf_path=source_path,
             output_pdf_path=out_pdf,
             approved_changes=approved_changes,
             resume_structure=parsed,
-            tighten_spacing=tighten_spacing,
+            tighten_spacing=effective_tighten,
+            relevance_items=rel_items_for_export,
         )
         orig_pages = pdf_res.page_count_original
         out_pages = pdf_res.page_count_output
+        overlap_passed = pdf_res.overlap_passed
+        overlap_details = list(pdf_res.overlap_details or [])
+        page_fit = dict(pdf_res.page_fit or {})
         if pdf_res.notice:
             theme_warnings.append(pdf_res.notice)
         theme_warnings.extend(pdf_res.font_substitutions)
@@ -945,6 +1322,11 @@ def export_resume_version(
         )
         similarity_score = verify.overall_similarity_score
         unchanged_similarity_score = verify.unchanged_similarity_score
+        if overlap_passed is None:
+            overlap_passed = verify.overlap_passed
+            overlap_details = list(verify.overlap_details or [])
+        if not page_fit:
+            page_fit = dict(verify.page_fit or {})
         theme_warnings.extend(verify.warnings)
         orig_png_bytes = verify.orig_preview_png
         out_png_bytes = verify.out_preview_png
@@ -952,19 +1334,33 @@ def export_resume_version(
             orig_png.write_bytes(orig_png_bytes)
         if out_png_bytes:
             out_png.write_bytes(out_png_bytes)
-        if not verify.passed:
+        page_fit_ok = page_fit.get("passed", True) if isinstance(page_fit, dict) else True
+        if not verify.passed or overlap_passed is False or page_fit_ok is False:
             export_blocked = True
             if verify.blocked_reason:
                 theme_warnings.insert(0, verify.blocked_reason)
+            elif page_fit_ok is False:
+                margin_v = float(page_fit.get("margin_pt", 0.0))
+                theme_warnings.insert(
+                    0,
+                    f"Page-fit margin ({margin_v:.1f}pt vs {page_fit.get('limit_y', 753.0):.1f}pt limit) "
+                    "is below 12pt or overflows Page 1. Choose a page-fit option before downloading.",
+                )
 
         # Fail-closed content-completeness & reading-order check
+        from app.services.resume.theme_verifier import extract_missing_blocks_from_errors
+
         comp_ok, comp_errors = verify_exported_pdf_completeness(
             original_pdf_path=source_path,
             output_pdf_path=out_pdf,
             applied_changes=approved_changes,
         )
+        missing_blocks: list[str] = []
         if not comp_ok:
             export_blocked = True
+            missing_blocks = extract_missing_blocks_from_errors(comp_errors)
+            if isinstance(page_fit, dict):
+                page_fit["missing_blocks"] = missing_blocks
             for err in reversed(comp_errors):
                 theme_warnings.insert(0, err)
 
@@ -1026,6 +1422,9 @@ def export_resume_version(
     version.overflow_suggestions = suggestions
     version.similarity_score = similarity_score
     version.unchanged_similarity_score = unchanged_similarity_score
+    version.overlap_passed = overlap_passed
+    version.overlap_details = overlap_details
+    version.page_fit = page_fit
     version.theme_warnings = list(dict.fromkeys(w for w in theme_warnings if w))
     version.export_blocked = export_blocked
     db.add(version)
@@ -1039,10 +1438,176 @@ def export_resume_version(
                 "message": version.theme_warnings[0] if version.theme_warnings else "Layout similarity verification failed.",
                 "similarity_score": similarity_score,
                 "unchanged_similarity_score": unchanged_similarity_score,
+                "overlap_passed": overlap_passed,
+                "overlap_details": overlap_details,
+                "overflow_detected": overflow,
+                "overflow_suggestions": suggestions,
+                "page_fit": page_fit,
+                "missing_blocks": (page_fit.get("missing_blocks") if isinstance(page_fit, dict) else None) or [],
                 "warnings": version.theme_warnings,
                 "version_id": version.id,
             },
         )
+    return _to_version_response(version)
+
+
+@router.post("/{app_id}/versions/{version_id}/page-fit-option", response_model=ResumeVersionResponse)
+def apply_page_fit_option(
+    app_id: str,
+    version_id: str,
+    payload: PageFitOptionApplyRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ResumeVersionResponse:
+    """
+    Apply a user-chosen page-fit option ('shorten_projects', 'condense_education',
+    or 'drop_lowest_relevance') so the blocked resume version fits cleanly with >= 12pt margin.
+    """
+    app_row = (
+        db.query(Application)
+        .filter(Application.id == app_id, Application.user_id == current_user.id)
+        .first()
+    )
+    if not app_row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Application not found.")
+
+    version = (
+        db.query(ResumeVersion)
+        .filter(ResumeVersion.id == version_id, ResumeVersion.application_id == app_id)
+        .first()
+    )
+    if not version:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resume version not found.")
+
+    resume = db.query(ResumeFile).filter(ResumeFile.id == app_row.resume_file_id).first()
+    if not resume:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source resume not found.")
+    job_post = db.query(JobPosting).filter(JobPosting.id == app_row.job_posting_id).first()
+    parsed = ParsedResumeStructure.model_validate(resume.parsed_structure)
+
+    opt = payload.option_id
+    if opt == "shorten_projects":
+        for ch in version.changes:
+            if ch.section.lower() == "projects" and ch.status in {"accepted", "edited"}:
+                cur_t = ch.edited_text or ch.new_text
+                short_t = _shorten_project_card_text(cur_t)
+                if short_t != cur_t:
+                    ch.edited_text = short_t
+                    ch.status = "edited"
+                    ch.validation_status = "passed"
+                    db.add(ch)
+    elif opt == "condense_education":
+        edu_details: list[str] = []
+        for ed in parsed.education:
+            for d in ed.details:
+                low = d.lower()
+                if "hackathon" in low or "qualifier" in low:
+                    continue
+                if any(k in low for k in ("workshop", "presentation", "documentation", "participated", "gained")):
+                    edu_details.append(d)
+        applied_count = 0
+        for d in edu_details[:2]:
+            existing = next(
+                (c for c in version.changes if c.section.lower() == "education" and (c.original_text or "").strip().lower() == d.strip().lower()),
+                None,
+            )
+            if applied_count == 0:
+                condensed = _condense_education_bullet(d)
+                if existing:
+                    existing.edited_text = condensed
+                    existing.status = "edited"
+                    existing.validation_status = "passed"
+                    db.add(existing)
+                else:
+                    db.add(
+                        Change(
+                            resume_version_id=version.id,
+                            section="education",
+                            change_type="bullet_edit",
+                            target_location={"index": 0},
+                            original_text=d,
+                            new_text=condensed,
+                            edited_text=condensed,
+                            reason="Condensed Education bullet to fit within 1-page margin (user-selected page-fit option).",
+                            evidence_refs=[],
+                            validation_status="passed",
+                            validation_warnings=[],
+                            status="edited",
+                        )
+                    )
+            else:
+                if existing:
+                    existing.status = "accepted"
+                    existing.validation_status = "passed"
+                    db.add(existing)
+                else:
+                    db.add(
+                        Change(
+                            resume_version_id=version.id,
+                            section="education",
+                            change_type="relevance_trim",
+                            target_location={"index": 0},
+                            original_text=d,
+                            new_text="",
+                            reason="Removed low-impact Education filler bullet to fit within 1-page margin (user-selected page-fit option).",
+                            evidence_refs=[],
+                            validation_status="passed",
+                            validation_warnings=[],
+                            status="accepted",
+                        )
+                    )
+            applied_count += 1
+    elif opt == "drop_lowest_relevance":
+        rel_items = _compute_app_relevance(resume, job_post)
+        low_items = [
+            it for it in rel_items
+            if (it.get("tier") == "low" or it.get("recommended_action") in {"remove", "shorten"})
+            and str(it.get("section") or "").lower() != "certifications"
+        ]
+        low_items.sort(key=lambda x: (float(x.get("score", 1.0)), -float(x.get("estimated_pt_saved", 0.0))))
+        accepted_trims = 0
+        for it in low_items[:3]:
+            txt = str(it.get("text", "")).strip()
+            existing = next(
+                (c for c in version.changes if c.change_type == "relevance_trim" and (c.original_text or "").strip().lower() == txt.lower()),
+                None,
+            )
+            if existing:
+                existing.status = "accepted"
+                existing.validation_status = "passed"
+                db.add(existing)
+                accepted_trims += 1
+            else:
+                db.add(
+                    Change(
+                        resume_version_id=version.id,
+                        section=str(it.get("section") or "certifications"),
+                        change_type="relevance_trim",
+                        target_location={"item_id": it.get("item_id")},
+                        original_text=txt,
+                        new_text="",
+                        reason=str(it.get("reason") or "Dropped lowest-relevance item to fit within 1-page margin (user-selected page-fit option)."),
+                        evidence_refs=[],
+                        validation_status="passed",
+                        validation_warnings=[],
+                        status="accepted",
+                    )
+                )
+                accepted_trims += 1
+        if accepted_trims == 0:
+            # Fall back to rejecting the lowest-relevance added GitHub project
+            proj_adds = [
+                ch for ch in version.changes
+                if ch.section.lower() == "projects" and ch.status in {"accepted", "edited"}
+            ]
+            if proj_adds:
+                proj_adds[-1].status = "rejected"
+                db.add(proj_adds[-1])
+
+    _clear_version_export_cache(version)
+    db.add(version)
+    db.commit()
+    db.refresh(version)
     return _to_version_response(version)
 
 

@@ -312,6 +312,13 @@ def rank_repos_for_job(
         )
 
     recs.sort(key=lambda r: (-r.relevance_score, -r.quality_score))
+    for idx, r in enumerate(recs):
+        if idx >= 1:
+            r.omitted_for_space = True
+            r.omission_reason = (
+                f"Omitted due to page-fit budget (1-page ceiling). "
+                f"Available as an alternative project option in page-fit selector (relevance: {r.relevance_score:.0f}/100)."
+            )
     return recs
 
 
@@ -355,15 +362,83 @@ def _clean_readme_sentences(readme_excerpt: str, repo_name: str) -> list[str]:
     return out
 
 
+_FRONTEND_HINTS = {
+    "react": "React",
+    "next": "Next.js",
+    "nextjs": "Next.js",
+    "next.js": "Next.js",
+    "vue": "Vue.js",
+    "angular": "Angular",
+    "svelte": "Svelte",
+    "tailwindcss": "Tailwind CSS",
+    "tailwind": "Tailwind CSS",
+    "vite": "React/Vite",
+}
+
+
+def _detect_frontend_label(repo: AnalyzedRepo) -> str | None:
+    """Identify the repo's frontend framework/UI layer if code/dependencies show one."""
+    deps_lower = [d.lower().strip() for d in repo.dependencies]
+    skills_lower = [s.lower().strip() for s in repo.inferred_skills]
+    for k, label in _FRONTEND_HINTS.items():
+        if k in deps_lower or k in skills_lower:
+            return label
+    has_ui_files = any(
+        f.lower().endswith((".tsx", ".jsx", ".html", ".css", ".vue", ".svelte"))
+        or f.lower().startswith(("frontend/", "client/", "web/", "app/src/"))
+        for f in repo.key_files
+    )
+    if has_ui_files or ("HTML" in repo.languages and "CSS" in repo.languages):
+        if "TypeScript" in repo.languages:
+            return "TypeScript UI"
+        return "HTML/CSS frontend"
+    return None
+
+
 def _select_stack_highlights(repo: AnalyzedRepo) -> list[str]:
-    """Select concise key technologies (frameworks + primary languages), avoiding noisy file-type dumps."""
+    """Select concise key technologies (frontend + backend/AI frameworks), avoiding noisy file-type dumps."""
     preferred: list[str] = []
     seen_lower: set[str] = set()
-    # First prioritize mapped dependencies (FastAPI, React, Next.js, etc.)
+    # Detect frameworks/AI tools strictly from verified dependencies, inferred code/import skills,
+    # and repo metadata — never substring-match prose like "node canvas" as "Node.js".
+    dep_tokens = [str(d).lower().strip() for d in (repo.dependencies or []) if str(d).strip()]
+    dep_set = set(dep_tokens)
+    skill_set = {str(s).lower().strip() for s in (repo.inferred_skills or []) if str(s).strip()}
+
+    def _has_dep(*names: str) -> bool:
+        for n in names:
+            if n in dep_set or any(d.startswith(n + "-") or d.endswith("/" + n) for d in dep_tokens):
+                return True
+        return False
+
+    evidence_checks: tuple[tuple[str, bool], ...] = (
+        ("React", _has_dep("react", "reactflow", "xyflow") or "react" in skill_set or "react.js" in skill_set),
+        ("Next.js", _has_dep("next", "nextjs") or "next.js" in skill_set or "nextjs" in skill_set),
+        ("FastAPI", _has_dep("fastapi", "uvicorn") or "fastapi" in skill_set),
+        ("LangGraph", _has_dep("langgraph") or "langgraph" in skill_set),
+        (
+            "Gemini",
+            _has_dep("google-generativeai", "google-genai", "generative-ai", "gemini")
+            or "gemini" in skill_set,
+        ),
+        (
+            "Node.js",
+            _has_dep("express", "fastify", "nestjs", "koa", "hono", "nodejs")
+            or "node.js" in skill_set
+            or "nodejs" in skill_set
+            or "node" in skill_set,
+        ),
+        ("Express.js", _has_dep("express") or "express" in skill_set or "express.js" in skill_set),
+    )
+    for label, matched in evidence_checks:
+        if matched and label.lower() not in seen_lower:
+            preferred.append(label)
+            seen_lower.add(label.lower())
+    # Then prioritized mapped dependencies (excluding noise like uvicorn/pytest)
     for dep in repo.dependencies:
         mapped = DEPENDENCY_SKILL_MAP.get(dep.lower().strip())
         cand = mapped or (dep.strip() if len(dep.strip()) <= 20 else "")
-        if cand and cand.lower() not in seen_lower and cand.lower() not in {"pytest"}:
+        if cand and cand.lower() not in seen_lower and cand.lower() not in {"pytest", "uvicorn"}:
             preferred.append(cand)
             seen_lower.add(cand.lower())
     # Then inferred skills excluding shell/markup noise
@@ -379,7 +454,7 @@ def _select_stack_highlights(repo: AnalyzedRepo) -> list[str]:
             if sk.lower() not in seen_lower:
                 preferred.append(sk)
                 seen_lower.add(sk.lower())
-    return preferred[:3]
+    return preferred[:5]
 
 
 def _extract_test_coverage_bullet(repo: AnalyzedRepo) -> tuple[str, str] | None:
@@ -457,42 +532,177 @@ def build_factual_repo_bullets_with_evidence(
     evidence: list[BulletEvidenceItem] = []
 
     stack = _select_stack_highlights(repo)
-    stack_phrase = " and ".join(stack) if len(stack) <= 2 else ", ".join(stack[:-1]) + f", and {stack[-1]}"
+    frontend_label = _detect_frontend_label(repo)
+    if frontend_label and frontend_label.lower() not in {s.lower() for s in stack}:
+        stack.insert(0, frontend_label)
+    stack_phrase = " and ".join(stack[:3]) if len(stack[:3]) <= 2 else ", ".join(stack[:2]) + f", and {stack[2]}"
     readme_sentences = _clean_readme_sentences(repo.readme_excerpt, repo.name)
     desc = re.sub(r"\s+", " ", (repo.description or "").strip()).rstrip(".")
 
-    # Bullet 1: What the project does + core stack
-    summary_text = desc or (readme_sentences[0] if readme_sentences else "")
+    def _fit_complete_bullet(text: str, max_len: int = 178) -> str:
+        t = re.sub(r"\s+", " ", text).strip()
+        if not t.endswith((".", "!", "?")):
+            t += "."
+        if len(t) <= max_len:
+            return t
+        # Preserve trailing "Uses ..." / "Built with ..." stack sentence when shortening the first sentence
+        sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", t) if s.strip()]
+        if len(sents) >= 2:
+            head_s = sents[0]
+            tail_s = " ".join(sents[1:])
+            budget_head = max(48, max_len - len(tail_s) - 1)
+            for sep in ("; ", " connecting ", " featuring ", " powered by ", ", "):
+                parts = head_s[:-1].split(sep)
+                if len(parts) > 1:
+                    cand_h = parts[0].rstrip(" .,;:-") + "."
+                    if len(cand_h) <= budget_head and len(cand_h.split()) >= 5:
+                        return f"{cand_h} {tail_s}"
+        for sep in ("; ", " connecting ", " featuring ", " including ", ", "):
+            parts = t[:-1].split(sep)
+            if len(parts) > 1:
+                for k in range(len(parts) - 1, 0, -1):
+                    cand = sep.join(parts[:k]).rstrip(" .,;:-") + "."
+                    if len(cand) <= max_len and len(cand.split()) >= 6:
+                        return cand
+        return t
+
+    def _with_indefinite_article(phrase: str) -> str:
+        p = phrase.strip()
+        if not p or re.match(r"^(?:a|an|the)\b", p, re.I):
+            return p
+        # Use 'an' before vowel sounds / AI-ML acronyms, 'a' otherwise
+        first = p.split()[0].strip(",.-").lower()
+        if first.startswith(("ai", "ml", "api", "html", "sql", "nlp", "http", "a", "e", "i", "o", "u")):
+            return f"an {p}"
+        return f"a {p}"
+
+    def _join_clean_stack(items: list[str]) -> str:
+        clean = [s.strip() for s in items if s.strip()]
+        if not clean:
+            return ""
+        if len(clean) == 1:
+            return clean[0]
+        if len(clean) == 2:
+            return f"{clean[0]} and {clean[1]}"
+        return f"{', '.join(clean[:-1])}, and {clean[-1]}"
+
+    # Bullet 1: What the project does + core stack + frontend when present (grammatical sentences, no 'A / B' slashes)
+    raw_summary = desc or (readme_sentences[0] if readme_sentences else "")
     summary_source = "Repository description + dependencies" if desc else "README + dependencies"
-    if summary_text:
-        # Lowercase leading article/adjective if joining cleanly with ", a ..." or description phrase
+    if raw_summary:
+        # Strip marketing hype / unproven buzzwords not backed by benchmark evidence
+        summary_text = re.sub(
+            r"\b(?:high-throughput|ultra-fast|blazing(?:ly)?\s+fast|scalable|industry-leading|world-class)\s+",
+            "",
+            raw_summary,
+            flags=re.IGNORECASE,
+        ).strip()
+        summary_text = re.sub(r"\s+", " ", summary_text).strip()
+
+        # Fix repetition: "Built X, a ... built with Y" -> "Built X, a ... using Y"
+        if re.search(r"\bbuilt with\b", summary_text, re.I):
+            summary_text = re.sub(r"\bbuilt with\b", "using", summary_text, count=1, flags=re.I)
+
         normalized_summary = summary_text
         if normalized_summary and not normalized_summary.startswith((repo.name, "API", "AI", "ML", "UI")):
             if len(normalized_summary) > 1 and normalized_summary[0].isupper() and normalized_summary[1].islower():
                 normalized_summary = normalized_summary[0].lower() + normalized_summary[1:]
-        missing_stack = [s for s in stack if s.lower() not in summary_text.lower()]
-        if missing_stack:
-            missing_phrase = (
-                " and ".join(missing_stack)
-                if len(missing_stack) <= 2
-                else ", ".join(missing_stack[:-1]) + f", and {missing_stack[-1]}"
-            )
-            b1 = f"Built {repo.name}, {normalized_summary}, using {missing_phrase}."
+        grammatical_summary = _with_indefinite_article(normalized_summary)
+
+        # Strict evidence check: never claim Redis or Docker unless present in repo dependencies, languages, or inferred skills
+        verified_tech_names = {
+            *(s.lower() for s in (repo.dependencies or [])),
+            *(s.lower() for s in (repo.inferred_skills or [])),
+            *(s.lower() for s in (repo.languages or {}).keys()),
+        }
+        filtered_stack = [
+            s for s in stack
+            if s.lower() in verified_tech_names
+            or any(v in s.lower() or s.lower() in v for v in verified_tech_names)
+        ]
+        missing_stack = [s for s in filtered_stack[:4] if s.lower() not in summary_text.lower()]
+        if frontend_label and frontend_label.lower() in {m.lower() for m in missing_stack}:
+            other_stack = [m for m in missing_stack if m.lower() != frontend_label.lower()][:3]
+            if other_stack:
+                tech_sent = f"Uses {_with_indefinite_article(frontend_label)} frontend with {_join_clean_stack(other_stack)}."
+            else:
+                tech_sent = f"Uses {_with_indefinite_article(frontend_label)} frontend."
+            b1 = _fit_complete_bullet(f"Built {repo.name}, {grammatical_summary}. {tech_sent}")
+        elif missing_stack:
+            b1 = _fit_complete_bullet(f"Built {repo.name}, {grammatical_summary}. Uses {_join_clean_stack(missing_stack[:4])}.")
         else:
-            b1 = f"Built {repo.name}, {normalized_summary}."
+            b1 = _fit_complete_bullet(f"Built {repo.name}, {grammatical_summary}.")
         bullets.append(b1)
+        tech_candidates: list[str] = []
+        seen_tc: set[str] = set()
+        for t in [*stack, *(repo.inferred_skills or []), *list((repo.languages or {}).keys())]:
+            ts = str(t).strip()
+            if ts and ts.lower() not in seen_tc:
+                seen_tc.add(ts.lower())
+                tech_candidates.append(ts)
+        listed_techs = [
+            t
+            for t in tech_candidates
+            if re.search(rf"(?<!\w){re.escape(t)}(?!\w)", b1, re.IGNORECASE)
+        ]
+        # Include stack highlights if fewer than 2 matched directly inside prose
+        for t in stack:
+            if t not in listed_techs:
+                listed_techs.append(t)
+
+        dep_list = [str(d).strip() for d in (repo.dependencies or []) if str(d).strip()]
+        lang_map = {str(k).lower(): (str(k), int(v)) for k, v in (repo.languages or {}).items()}
+        key_files_list = [str(f).strip() for f in (repo.key_files or []) if str(f).strip()]
+        per_tech_ev: list[str] = []
+        _dep_aliases = {
+            "react": ("react", "react-dom", "reactflow", "@xyflow/react"),
+            "next.js": ("next", "nextjs"),
+            "fastapi": ("fastapi", "uvicorn"),
+            "langgraph": ("langgraph", "@langchain/langgraph"),
+            "gemini": ("google-generativeai", "@google/generative-ai", "google-genai", "gemini"),
+            "node.js": ("express", "fastify", "nestjs", "@nestjs/core", "nodejs"),
+            "express.js": ("express",),
+            "pytorch": ("torch", "pytorch"),
+            "tailwind css": ("tailwindcss",),
+        }
+        for tech in listed_techs:
+            tl = tech.lower()
+            parts: list[str] = []
+            aliases = _dep_aliases.get(tl, (tl,))
+            matched_deps = [
+                d for d in dep_list if d.lower() in aliases or any(al in d.lower() for al in aliases)
+            ]
+            if matched_deps:
+                parts.append(f"dependencies ({', '.join(matched_deps[:3])})")
+            if tl in lang_map:
+                orig_k, bcount = lang_map[tl]
+                parts.append(f"language stats ({orig_k}: {bcount:,} B)")
+            elif tl in {"fastapi", "langgraph"} and "python" in lang_map and not matched_deps:
+                parts.append("Python repository code")
+            elif tl in {"react", "next.js"} and any(k in lang_map for k in ("javascript", "typescript")) and not matched_deps:
+                parts.append("JS/TS repository code")
+            if not parts and key_files_list:
+                parts.append(f"repo files ({', '.join(key_files_list[:2])})")
+            if not parts and any(s.lower() == tl for s in (repo.inferred_skills or [])):
+                parts.append("inferred from repository imports/code")
+            per_tech_ev.append(f"{tech}: {', '.join(parts) if parts else summary_source}")
+
+        detail_str = f"{summary_source} | Tech evidence — {'; '.join(per_tech_ev)}" if per_tech_ev else f"{summary_source} ({repo.primary_language or 'repository'})"
         evidence.append(
             BulletEvidenceItem(
                 bullet=b1,
                 source=summary_source,
-                detail=f"{summary_source} ({', '.join(stack) or repo.primary_language or 'repository'})",
+                detail=detail_str,
             )
         )
     else:
         modules = [f.split("/")[0] for f in repo.key_files if "/" in f]
         top_modules = list(dict.fromkeys(m for m in modules if not m.startswith(".")))[:2]
         mod_note = f" across {' and '.join(top_modules)} modules" if top_modules else ""
-        b1 = f"Developed {repo.name} using {stack_phrase or 'modular software architecture'}{mod_note}."
+        fe_note = f" with a {frontend_label} frontend" if frontend_label else ""
+        b1 = _fit_complete_bullet(
+            f"Developed {repo.name} using {stack_phrase or 'modular software architecture'}{fe_note}{mod_note}."
+        )
         bullets.append(b1)
         evidence.append(
             BulletEvidenceItem(

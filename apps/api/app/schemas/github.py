@@ -39,6 +39,7 @@ class AnalyzedRepo(BaseModel):
     quality_score: float = 0.0  # 0 to 100
     quality_notes: list[str] = Field(default_factory=list)
     excluded_reason: Optional[str] = None
+    is_mock: bool = False
 
 
 class DetectedGitHubSkill(BaseModel):
@@ -83,3 +84,6 @@ class RepoRecommendation(BaseModel):
     draft_bullets: list[str] = Field(default_factory=list)
     bullet_evidence: list[BulletEvidenceItem] = Field(default_factory=list)
     decision: str = "pending"  # pending | approved | rejected
+    is_mock: bool = False
+    omitted_for_space: bool = False
+    omission_reason: Optional[str] = None

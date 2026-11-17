@@ -198,13 +198,45 @@ def _merge_same_baseline_lines(lines: list[dict[str, Any]]) -> list[dict[str, An
     return [l for l in merged if l["text"]]
 
 
-def _order_and_merge_paragraphs(lines: list[dict[str, Any]], page_width: float) -> list[dict[str, Any]]:
+def _detect_pdf_vertical_divider(page: fitz.Page) -> tuple[float, float, float] | None:
+    """Detect a vertical column separator line dividing sidebar (< div_x) and main (>= div_x) sections."""
+    pw = float(page.rect.width)
+    ph = float(page.rect.height)
+    for dr in page.get_drawings():
+        r = dr.get("rect")
+        if not r:
+            continue
+        w = abs(float(r.x1) - float(r.x0))
+        h = abs(float(r.y1) - float(r.y0))
+        cx = (float(r.x0) + float(r.x1)) * 0.5
+        if w <= 3.0 and h >= max(100.0, ph * 0.14) and pw * 0.22 <= cx <= pw * 0.58:
+            return round(cx, 2), round(float(r.y0), 2), round(float(r.y1), 2)
+    return None
+
+
+def _order_and_merge_paragraphs(
+    lines: list[dict[str, Any]],
+    page_width: float,
+    vertical_divider: tuple[float, float, float] | None = None,
+) -> list[dict[str, Any]]:
     """
-    Segment lines into sections, handle two-column sections (reading left column
+    Segment lines into sections, handle two-column / sidebar layouts (reading left column
     before right column), and merge wrapped continuation lines into single paragraphs.
     """
     if not lines:
         return []
+
+    if vertical_divider is not None:
+        div_x, div_y0, _ = vertical_divider
+        top_lines = [l for l in lines if l["bbox"][1] < div_y0 - 2.0]
+        left_col = [l for l in lines if l["bbox"][1] >= div_y0 - 2.0 and l["bbox"][0] < div_x]
+        right_col = [l for l in lines if l["bbox"][1] >= div_y0 - 2.0 and l["bbox"][0] >= div_x]
+        if left_col and right_col:
+            return (
+                _order_and_merge_paragraphs(top_lines, page_width, None)
+                + _order_and_merge_paragraphs(left_col, page_width, None)
+                + _order_and_merge_paragraphs(right_col, page_width, None)
+            )
 
     # 1. Identify explicit section heading anchors top-to-bottom
     annotated: list[dict[str, Any]] = []
@@ -311,7 +343,7 @@ def _order_and_merge_paragraphs(lines: list[dict[str, Any]], page_width: float) 
                 # Allow short tail of wrapped summary paragraph
                 if len(prev["text"]) < 55:
                     return False
-        if nxt["had_bullet"]:
+        if nxt["had_bullet"] or nxt["text"].lstrip().startswith(("- ", "• ", "* ")):
             return False
         # Do not merge across bold title changes (except mixed bold-italic inside summary)
         if prev["is_bold"] != nxt["is_bold"] and section != "header":
@@ -383,7 +415,19 @@ def _order_and_merge_paragraphs(lines: list[dict[str, Any]], page_width: float) 
                     paras.append(p_copy)
             merged_elements.extend(paras)
 
-    return merged_elements
+    # Detect duplicate text layers/blocks in input and deduplicate so extracted text reads once in order
+    deduped_elements: list[dict[str, Any]] = []
+    seen_sigs: set[str] = set()
+    for el in merged_elements:
+        t_norm = re.sub(r"\s+", " ", el.get("text", "")).strip().lower()
+        if len(t_norm) > 15:
+            sig = f"{el.get('assigned_section')}:{t_norm}"
+            if sig in seen_sigs:
+                continue
+            seen_sigs.add(sig)
+        deduped_elements.append(el)
+
+    return deduped_elements
 
 
 def extract_pdf_style_tokens(doc: fitz.Document) -> dict[str, Any]:
@@ -394,6 +438,7 @@ def extract_pdf_style_tokens(doc: fitz.Document) -> dict[str, Any]:
     heading_font = "Helvetica"
     heading_size = 14.0
     heading_color = "#333333"
+    heading_bold = False
     body_font = "Helvetica"
     body_size = 10.0
     body_color = "#404040"
@@ -456,8 +501,9 @@ def extract_pdf_style_tokens(doc: fitz.Document) -> dict[str, Any]:
                     if sz >= 18.0:
                         if sz > name_size or name_font == "Helvetica":
                             name_font, name_size, name_color = fnt, sz, col
-                    elif detect_section_heading(txt) and sz >= 11.5:
+                    elif detect_section_heading(txt) and sz >= 10.5:
                         heading_font, heading_size, heading_color = fnt, sz, col
+                        heading_bold = "bold" in fnt.lower() or bool(int(sp.get("flags", 0)) & 16)
                     elif col.lower() in ("#0563c1", "#1155cc", "#0000ee", "#0066cc"):
                         link_color = col
                     else:
@@ -493,6 +539,7 @@ def extract_pdf_style_tokens(doc: fitz.Document) -> dict[str, Any]:
         "heading_font": heading_font,
         "heading_size": heading_size,
         "heading_color": heading_color,
+        "heading_bold": heading_bold,
         "body_font": body_font,
         "body_size": body_size,
         "body_color": body_color,
@@ -521,7 +568,8 @@ def parse_pdf_resume(
     for pno, page in enumerate(doc):
         raw_lines = _extract_raw_lines(page, pno)
         baseline_merged = _merge_same_baseline_lines(raw_lines)
-        ordered = _order_and_merge_paragraphs(baseline_merged, float(page.rect.width))
+        vdiv = _detect_pdf_vertical_divider(page)
+        ordered = _order_and_merge_paragraphs(baseline_merged, float(page.rect.width), vertical_divider=vdiv)
         all_paragraphs.extend(ordered)
         for lk in page.get_links() or []:
             if lk.get("uri") and lk.get("from"):

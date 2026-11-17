@@ -1,4 +1,5 @@
 import copy
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -18,24 +19,26 @@ from app.services.resume.section_parser import detect_section_heading
 
 def _iter_all_paragraphs(doc: Document):
     """Yield unique Paragraph objects across body and table cells."""
-    seen_p: set[int] = set()
+    # Hold strong references to the underlying XML elements (NOT id(...)) so lxml proxies
+    # cannot be garbage-collected and have their memory addresses reused mid-iteration.
+    seen_p: set[Any] = set()
     for p in doc.paragraphs:
-        pid = id(p._p)
-        if pid not in seen_p:
-            seen_p.add(pid)
+        pel = p._p
+        if pel not in seen_p:
+            seen_p.add(pel)
             yield p
-    seen_cells: set[int] = set()
+    seen_cells: set[Any] = set()
     for tbl in doc.tables:
         for row in tbl.rows:
             for cell in row.cells:
-                cid = id(cell._tc)
-                if cid in seen_cells:
+                tc = cell._tc
+                if tc in seen_cells:
                     continue
-                seen_cells.add(cid)
+                seen_cells.add(tc)
                 for p in cell.paragraphs:
-                    pid = id(p._p)
-                    if pid not in seen_p:
-                        seen_p.add(pid)
+                    pel = p._p
+                    if pel not in seen_p:
+                        seen_p.add(pel)
                         yield p
 
 
@@ -188,22 +191,33 @@ def apply_changes_to_docx_in_place(
     doc = Document(str(source_docx_path))
     warnings: list[str] = []
 
-    # 1. Direct in-place text replacements (reworded, reordered)
+    # 1. Direct in-place text replacements (reworded, reordered, typo_fix) and relevance trims
     for ch in approved_changes:
         ctype = ch.get("change_type")
-        if ctype not in {"reworded", "reordered"}:
+        if ctype not in {"reworded", "reordered", "typo_fix", "relevance_trim"}:
             continue
         loc = ch.get("target_location") or {}
+        action = loc.get("action") if isinstance(loc, dict) else None
+        orig = (ch.get("original_text") or "").strip()
         final_text = (ch.get("edited_text") or ch.get("new_text") or "").strip()
+        if ctype == "relevance_trim" and (action == "remove" or not final_text):
+            para = _find_paragraph_by_location(doc, loc)
+            if para is None and orig:
+                para = next((p for p in _iter_all_paragraphs(doc) if orig in p.text), None)
+            if para is not None and para._p.getparent() is not None:
+                para._p.getparent().remove(para._p)
+            continue
         if not final_text:
             continue
 
         para = _find_paragraph_by_location(doc, loc)
-        if para is None:
-            # Fallback match by original_text across body AND table cells
-            orig = (ch.get("original_text") or "").strip()
-            if orig:
-                para = next((p for p in _iter_all_paragraphs(doc) if orig in p.text), None)
+        if para is None and orig:
+            # Fallback match by original_text across body AND table cells (case-sensitive then insensitive)
+            all_p = list(_iter_all_paragraphs(doc))
+            para = next((p for p in all_p if orig in p.text), None)
+            if para is None:
+                orig_low = orig.lower()
+                para = next((p for p in all_p if orig_low in p.text.lower()), None)
         if para is None:
             warnings.append(f"Could not locate paragraph for {ch.get('section')} edit.")
             continue
@@ -215,6 +229,18 @@ def apply_changes_to_docx_in_place(
                 prefix = "• " if lines[line_idx].lstrip().startswith("•") and not final_text.startswith("•") else ""
                 lines[line_idx] = prefix + final_text
                 _replace_paragraph_text_preserving_style(para, "\n".join(lines))
+                continue
+
+        # Substring replacement (e.g. "Detail- Detail-oriented" or project title typo before hyperlink)
+        run_text = "".join(r.text for r in para.runs)
+        if orig and orig != para.text.strip() and len(orig) < max(40, int(len(para.text) * 0.7)):
+            if orig in run_text:
+                _replace_paragraph_text_preserving_style(para, run_text.replace(orig, final_text, 1))
+                continue
+            m_ci = re.search(re.escape(orig), run_text, re.IGNORECASE)
+            if m_ci:
+                new_run_text = run_text[: m_ci.start()] + final_text + run_text[m_ci.end() :]
+                _replace_paragraph_text_preserving_style(para, new_run_text)
                 continue
 
         # Preserve leading bullet symbol if paragraph relies on text bullet rather than numPr
@@ -246,11 +272,16 @@ def apply_changes_to_docx_in_place(
             ):
                 sample_bullet_para = p
 
+        seen_additions: set[str] = set()
         for ch in additions:
             ctype = ch.get("change_type")
             text = (ch.get("edited_text") or ch.get("new_text") or "").strip()
             if not text:
                 continue
+            add_key = f"{ctype}:{text[:60].lower()}"
+            if add_key in seen_additions:
+                continue
+            seen_additions.add(add_key)
 
             if ctype == "added_from_github":
                 anchor = heading_paras.get("projects") or (doc.paragraphs[-1] if doc.paragraphs else None)
@@ -267,6 +298,7 @@ def apply_changes_to_docx_in_place(
                         cursor_el = p._p
                 else:
                     cursor = anchor
+                    gh_url = str((ch.get("target_location") or {}).get("html_url") or "").strip()
                     for idx, ln in enumerate(lines):
                         is_bullet_line = ln.startswith(("•", "-", "–")) or idx > 0
                         clean_ln = ln.lstrip("•-– ").strip()
@@ -284,28 +316,39 @@ def apply_changes_to_docx_in_place(
                             r_el.append(t_el)
                             new_p.append(r_el)
                             cursor._p.addnext(new_p)
-                            # Wrap in Paragraph-like anchor using doc.paragraphs lookup or direct xml
                             class _XmlAnchor:
                                 def __init__(self, el):
                                     self._p = el
                             cursor = _XmlAnchor(new_p)
                         else:
-                            new_p_el = _clone_paragraph_after(cursor, clean_ln, bold_override=True)
+                            m_gh = re.match(r"^(.*?\s[-—|]\s*)(GITHUB)$", clean_ln, re.IGNORECASE) if (idx == 0 and gh_url) else None
+                            if m_gh:
+                                new_p_el = _clone_paragraph_after(cursor, m_gh.group(1), bold_override=True)
+                                from docx.text.paragraph import Paragraph as _DocxParagraph
+                                p_obj = _DocxParagraph(new_p_el, doc._body)
+                                _add_hyperlink(p_obj, gh_url, m_gh.group(2), font_size_pt=9.5)
+                            else:
+                                new_p_el = _clone_paragraph_after(cursor, clean_ln, bold_override=True)
+                                if idx == 0 and gh_url:
+                                    from docx.text.paragraph import Paragraph as _DocxParagraph
+                                    p_obj = _DocxParagraph(new_p_el, doc._body)
+                                    sr = p_obj.add_run(" - ")
+                                    _add_hyperlink(p_obj, gh_url, "GITHUB", font_size_pt=9.5)
                             class _XmlAnchor:
                                 def __init__(self, el):
                                     self._p = el
                             cursor = _XmlAnchor(new_p_el)
 
             elif ctype == "user_confirmed_skill":
-                anchor = heading_paras.get("skill_development")
+                anchor = heading_paras.get("skills") or heading_paras.get("skill_development")
                 if anchor is None and all_paras:
                     tail = all_paras[-1]
                     if sample_heading_para is not None:
-                        h_el = _clone_paragraph_after(tail, "Skill Development", bold_override=True)
+                        h_el = _clone_paragraph_after(tail, "Skills", bold_override=True)
                         p = doc.add_paragraph(text)
                         h_el.addnext(p._p)
                     else:
-                        doc.add_paragraph("Skill Development")
+                        doc.add_paragraph("Skills")
                         doc.add_paragraph(text)
                 elif anchor is not None:
                     _clone_paragraph_after(anchor, text, bold_override=False)
@@ -364,18 +407,19 @@ def build_ats_docx_from_structure(
 
     doc = Document()
     for sec in doc.sections:
-        sec.top_margin = Inches(0.45)
-        sec.bottom_margin = Inches(0.45)
-        sec.left_margin = Inches(0.55)
-        sec.right_margin = Inches(0.55)
+        sec.top_margin = Inches(0.35)
+        sec.bottom_margin = Inches(0.35)
+        sec.left_margin = Inches(0.45)
+        sec.right_margin = Inches(0.45)
 
+    # Keep 1-page ATS DOCX compact so multi-project additions match the 1-page PDF preview
     normal_style = doc.styles["Normal"]
     normal_style.font.name = body_font
-    normal_style.font.size = Pt(body_size)
+    normal_style.font.size = Pt(min(body_size, 9.2))
     normal_style.font.color.rgb = body_color
     normal_style.paragraph_format.space_before = Pt(0)
-    normal_style.paragraph_format.space_after = Pt(2)
-    normal_style.paragraph_format.line_spacing = 1.08
+    normal_style.paragraph_format.space_after = Pt(1)
+    normal_style.paragraph_format.line_spacing = 1.03
 
     # Header: Name
     h = doc.add_paragraph()
@@ -414,11 +458,13 @@ def build_ats_docx_from_structure(
                 cr = contact_para.add_run(cleaned)
                 _format_docx_run(cr, font_name=body_font, size_pt=body_size - 0.5, color=body_color)
 
+    project_urls = {(p.url or "").strip().lower() for p in (structure.projects or []) if p.url}
     for lnk in structure.links or []:
         url = (lnk.get("url", "") if isinstance(lnk, dict) else getattr(lnk, "url", "") or "").strip()
-        if not url or url.lower() in seen_pieces:
+        low_u = url.lower()
+        if not url or low_u in seen_pieces or "credly.com" in low_u or low_u in project_urls:
             continue
-        seen_pieces.add(url.lower())
+        seen_pieces.add(low_u)
         label = (lnk.get("label", "") if isinstance(lnk, dict) else getattr(lnk, "label", "") or "").strip()
         if not label or "://" in label:
             low = url.lower()
@@ -452,87 +498,149 @@ def build_ats_docx_from_structure(
     reword_map = {
         (ch.get("original_text") or "").strip(): (ch.get("edited_text") or ch.get("new_text") or "").strip()
         for ch in approved_changes
-        if ch.get("change_type") == "reworded"
+        if ch.get("change_type") in {"reworded", "typo_fix"} and (ch.get("original_text") or "").strip()
     }
-    section_override = {
-        (ch.get("section") or "").strip(): (ch.get("edited_text") or ch.get("new_text") or "").strip()
+    substring_fixes = [
+        ((ch.get("original_text") or "").strip(), (ch.get("edited_text") or ch.get("new_text") or "").strip())
         for ch in approved_changes
-        if ch.get("change_type") in {"reworded", "reordered"} and ch.get("section")
+        if ch.get("change_type") in {"reworded", "typo_fix"}
+        and ch.get("section") != "skills"
+        and (ch.get("original_text") or "").strip()
+        and (ch.get("edited_text") or ch.get("new_text") or "").strip()
+    ]
+    removed_originals = {
+        (ch.get("original_text") or "").strip().lower()
+        for ch in approved_changes
+        if ch.get("change_type") == "relevance_trim"
+        and (
+            (ch.get("target_location") or {}).get("action") == "remove"
+            or not (ch.get("edited_text") or ch.get("new_text") or "").strip()
+        )
+        and (ch.get("original_text") or "").strip()
     }
 
-    summary_text = section_override.get("summary") or structure.summary
+    def _apply_text_edits(raw_val: str) -> str:
+        s = (raw_val or "").strip()
+        if not s:
+            return ""
+        if s in reword_map:
+            return reword_map[s]
+        for orig_s, new_s in substring_fixes:
+            if orig_s in s:
+                s = s.replace(orig_s, new_s, 1)
+            else:
+                m_ci = re.search(re.escape(orig_s), s, re.IGNORECASE)
+                if m_ci and len(orig_s) >= 8:
+                    s = s[: m_ci.start()] + new_s + s[m_ci.end() :]
+        return s
+
+    summary_text = structure.summary or ""
+    summary_full_override: str | None = None
+    for ch in approved_changes:
+        if ch.get("section") == "summary" and ch.get("change_type") in {"reworded", "reordered"}:
+            orig_s = (ch.get("original_text") or "").strip()
+            new_s = (ch.get("edited_text") or ch.get("new_text") or "").strip()
+            if new_s and (not orig_s or len(orig_s) >= max(40, int(len(summary_text) * 0.5))):
+                summary_full_override = new_s
+    summary_text = summary_full_override or _apply_text_edits(summary_text)
+
     if summary_text:
         _add_section_heading("Summary")
         sp = doc.add_paragraph(_clean_doc_text(summary_text))
         for sr in sp.runs:
-            _format_docx_run(sr, font_name=body_font, size_pt=body_size, color=body_color)
+            _format_docx_run(sr, font_name=body_font, size_pt=min(body_size, 9.2), color=body_color)
 
     if structure.experience:
         _add_section_heading("Experience")
         for exp in structure.experience:
             header_parts = [p for p in (exp.title, exp.company, exp.location, exp.dates) if p]
             ep = doc.add_paragraph()
-            ep.paragraph_format.space_after = Pt(1)
+            ep.paragraph_format.space_after = Pt(0.5)
             er = ep.add_run(_clean_doc_text(" | ".join(header_parts)))
-            _format_docx_run(er, font_name=body_font, size_pt=body_size, color=body_color, bold=True)
+            _format_docx_run(er, font_name=body_font, size_pt=min(body_size, 9.2), color=body_color, bold=True)
             for b in exp.bullets:
-                replaced = reword_map.get(b.strip(), b)
+                if b.strip().lower() in removed_originals:
+                    continue
+                replaced = _apply_text_edits(b)
                 bp = doc.add_paragraph(_clean_doc_text(replaced), style="List Bullet")
-                bp.paragraph_format.space_after = Pt(1)
+                bp.paragraph_format.space_after = Pt(0.5)
                 for br in bp.runs:
-                    _format_docx_run(br, font_name=body_font, size_pt=body_size - 0.2, color=body_color)
+                    _format_docx_run(br, font_name=body_font, size_pt=min(body_size, 9.0), color=body_color)
 
     github_adds = [ch for ch in approved_changes if ch.get("change_type") == "added_from_github"]
     if structure.projects or github_adds:
         _add_section_heading("Projects")
         for proj in structure.projects:
             pp = doc.add_paragraph()
-            pp.paragraph_format.space_after = Pt(1)
-            pr = pp.add_run(_clean_doc_text(proj.name))
-            _format_docx_run(pr, font_name=body_font, size_pt=body_size, color=body_color, bold=True)
+            pp.paragraph_format.space_after = Pt(0.5)
+            proj_name_edited = _apply_text_edits(proj.name)
+            pr = pp.add_run(_clean_doc_text(proj_name_edited))
+            _format_docx_run(pr, font_name=body_font, size_pt=min(body_size, 9.2), color=body_color, bold=True)
             if proj.tech_stack:
                 tr = pp.add_run(f" — {', '.join(_clean_doc_text(t).rstrip('.') for t in proj.tech_stack)}")
-                _format_docx_run(tr, font_name=body_font, size_pt=body_size - 0.4, color=body_color, italic=True)
+                _format_docx_run(tr, font_name=body_font, size_pt=min(body_size, 8.8), color=body_color, italic=True)
             if proj.url:
-                sr = pp.add_run("  [")
-                _format_docx_run(sr, font_name=body_font, size_pt=body_size - 0.5, color=body_color)
-                _add_hyperlink(pp, proj.url, "GitHub", font_name=body_font, font_size_pt=body_size - 0.5, color=accent_color)
-                er = pp.add_run("]")
-                _format_docx_run(er, font_name=body_font, size_pt=body_size - 0.5, color=body_color)
+                sr = pp.add_run(" - ")
+                _format_docx_run(sr, font_name=body_font, size_pt=min(body_size, 8.8), color=body_color)
+                _add_hyperlink(pp, proj.url, "GITHUB", font_name=body_font, font_size_pt=min(body_size, 8.8), color=accent_color)
             for b in proj.bullets:
-                replaced = reword_map.get(b.strip(), b)
+                if b.strip().lower() in removed_originals:
+                    continue
+                replaced = _apply_text_edits(b)
                 bp = doc.add_paragraph(_clean_doc_text(replaced), style="List Bullet")
-                bp.paragraph_format.space_after = Pt(1)
+                bp.paragraph_format.space_after = Pt(0.5)
                 for br in bp.runs:
-                    _format_docx_run(br, font_name=body_font, size_pt=body_size - 0.2, color=body_color)
+                    _format_docx_run(br, font_name=body_font, size_pt=min(body_size, 9.0), color=body_color)
         for ch in github_adds:
             text = _clean_doc_text(ch.get("edited_text") or ch.get("new_text") or "")
+            gh_url = str((ch.get("target_location") or {}).get("html_url") or "").strip()
             for idx, ln in enumerate(text.splitlines()):
                 if idx == 0:
                     gp = doc.add_paragraph()
-                    gr = gp.add_run(ln)
-                    _format_docx_run(gr, font_name=body_font, size_pt=body_size, color=body_color, bold=True)
+                    gp.paragraph_format.space_after = Pt(0.5)
+                    m_gh = re.match(r"^(.*?\s[-—|]\s*)(GITHUB)$", ln.strip(), re.IGNORECASE) if gh_url else None
+                    if m_gh:
+                        gr = gp.add_run(m_gh.group(1))
+                        _format_docx_run(gr, font_name=body_font, size_pt=min(body_size, 9.2), color=body_color, bold=True)
+                        _add_hyperlink(gp, gh_url, m_gh.group(2).upper(), font_name=body_font, font_size_pt=min(body_size, 8.8), color=accent_color)
+                    else:
+                        gr = gp.add_run(ln)
+                        _format_docx_run(gr, font_name=body_font, size_pt=min(body_size, 9.2), color=body_color, bold=True)
+                        if gh_url:
+                            sr = gp.add_run(" - ")
+                            _format_docx_run(sr, font_name=body_font, size_pt=min(body_size, 8.8), color=body_color)
+                            _add_hyperlink(gp, gh_url, "GITHUB", font_name=body_font, font_size_pt=min(body_size, 8.8), color=accent_color)
                 else:
                     bp = doc.add_paragraph(ln.lstrip("•- ").strip(), style="List Bullet")
+                    bp.paragraph_format.space_after = Pt(0.5)
                     for br in bp.runs:
-                        _format_docx_run(br, font_name=body_font, size_pt=body_size - 0.2, color=body_color)
+                        _format_docx_run(br, font_name=body_font, size_pt=min(body_size, 9.0), color=body_color)
 
     if structure.education:
         _add_section_heading("Education")
         for edu in structure.education:
-            header_parts = [p for p in (edu.institution, edu.degree, edu.dates, *edu.details) if p]
-            edp = doc.add_paragraph(_clean_doc_text(" | ".join(header_parts)))
-            for edr in edp.runs:
-                _format_docx_run(edr, font_name=body_font, size_pt=body_size, color=body_color)
+            header_parts = [p for p in (edu.institution, edu.degree, edu.dates) if p]
+            if header_parts:
+                edp = doc.add_paragraph(_clean_doc_text(" | ".join(header_parts)))
+                edp.paragraph_format.space_after = Pt(0.5)
+                for edr in edp.runs:
+                    _format_docx_run(edr, font_name=body_font, size_pt=min(body_size, 9.2), color=body_color, bold=True)
+            for det in edu.details:
+                if det.strip().lower() in removed_originals:
+                    continue
+                dp = doc.add_paragraph(_clean_doc_text(_apply_text_edits(det)), style="List Bullet")
+                dp.paragraph_format.space_after = Pt(0.5)
+                for dr in dp.runs:
+                    _format_docx_run(dr, font_name=body_font, size_pt=min(body_size, 9.0), color=body_color)
 
-    skill_reorders = [
+    skill_updates = [
         ch
         for ch in approved_changes
-        if ch.get("change_type") == "reordered" and ch.get("section") == "skills"
+        if ch.get("change_type") in {"reordered", "reworded", "added"} and ch.get("section") == "skills"
     ]
     reordered_by_cat: dict[str, str] = {}
     reordered_flat: str | None = None
-    for ch in skill_reorders:
+    for ch in skill_updates:
         nt = _clean_doc_text(ch.get("edited_text") or ch.get("new_text") or "")
         if ":" in nt:
             cat_k, rest = nt.split(":", 1)
@@ -540,9 +648,10 @@ def build_ats_docx_from_structure(
         elif nt:
             reordered_flat = nt
 
-    if structure.skill_categories:
+    learning_adds = [ch for ch in approved_changes if ch.get("change_type") == "user_confirmed_skill"]
+    if structure.skill_categories or learning_adds or reordered_by_cat:
         _add_section_heading("Skills")
-        for cat_label, items in structure.skill_categories.items():
+        for cat_label, items in (structure.skill_categories or {}).items():
             line_val = reordered_by_cat.get(cat_label.strip().lower())
             if not line_val:
                 cleaned_items = [_clean_doc_text(i).rstrip(".") for i in items if _clean_doc_text(i)]
@@ -550,33 +659,59 @@ def build_ats_docx_from_structure(
             if not line_val:
                 continue
             sp = doc.add_paragraph()
-            sp.paragraph_format.space_after = Pt(1.5)
+            sp.paragraph_format.space_after = Pt(0.8)
             lbl_run = sp.add_run(f"{cat_label}: ")
-            _format_docx_run(lbl_run, font_name=body_font, size_pt=body_size, color=body_color, bold=True)
+            _format_docx_run(lbl_run, font_name=body_font, size_pt=min(body_size, 9.0), color=body_color, bold=True)
             val_run = sp.add_run(line_val.rstrip("."))
-            _format_docx_run(val_run, font_name=body_font, size_pt=body_size, color=body_color)
+            _format_docx_run(val_run, font_name=body_font, size_pt=min(body_size, 9.0), color=body_color)
+        for cat_k, rest in reordered_by_cat.items():
+            if not any(k.strip().lower() == cat_k for k in (structure.skill_categories or {}).keys()):
+                sp = doc.add_paragraph()
+                sp.paragraph_format.space_after = Pt(0.8)
+                disp_k = "Web Services & Architecture" if "web services" in cat_k else cat_k.title()
+                lbl_run = sp.add_run(f"{disp_k}: ")
+                _format_docx_run(lbl_run, font_name=body_font, size_pt=min(body_size, 9.0), color=body_color, bold=True)
+                val_run = sp.add_run(rest.rstrip("."))
+                _format_docx_run(val_run, font_name=body_font, size_pt=min(body_size, 9.0), color=body_color)
+        for ch in learning_adds:
+            ltxt = _clean_doc_text(ch.get("edited_text") or ch.get("new_text") or "")
+            if not ltxt:
+                continue
+            lp = doc.add_paragraph()
+            lp.paragraph_format.space_after = Pt(0.8)
+            if ":" in ltxt:
+                lk, lv = ltxt.split(":", 1)
+                lr1 = lp.add_run(f"{lk.strip()}: ")
+                _format_docx_run(lr1, font_name=body_font, size_pt=min(body_size, 9.0), color=body_color, bold=True)
+                lr2 = lp.add_run(lv.strip())
+                _format_docx_run(lr2, font_name=body_font, size_pt=min(body_size, 9.0), color=body_color)
+            else:
+                lr = lp.add_run(ltxt)
+                _format_docx_run(lr, font_name=body_font, size_pt=min(body_size, 9.0), color=body_color)
     elif reordered_flat or structure.skills:
         _add_section_heading("Skills")
         flat_txt = reordered_flat or ", ".join(_clean_doc_text(s).rstrip(".") for s in structure.skills if _clean_doc_text(s))
         sp = doc.add_paragraph(flat_txt)
         for sr in sp.runs:
-            _format_docx_run(sr, font_name=body_font, size_pt=body_size, color=body_color)
+            _format_docx_run(sr, font_name=body_font, size_pt=min(body_size, 9.0), color=body_color)
 
     if structure.certifications:
-        _add_section_heading("Certifications")
-        for cert in structure.certifications:
-            cp = doc.add_paragraph(style="List Bullet")
-            cp.paragraph_format.space_after = Pt(1)
-            cr = cp.add_run(_clean_doc_text(cert))
-            _format_docx_run(cr, font_name=body_font, size_pt=body_size - 0.2, color=body_color)
-
-    learning_adds = [ch for ch in approved_changes if ch.get("change_type") == "user_confirmed_skill"]
-    if learning_adds:
-        _add_section_heading("Currently Learning")
-        for ch in learning_adds:
-            lp = doc.add_paragraph(_clean_doc_text(ch.get("edited_text") or ch.get("new_text") or ""))
-            for lr in lp.runs:
-                _format_docx_run(lr, font_name=body_font, size_pt=body_size, color=body_color)
+        kept_certs = [c for c in structure.certifications if c.strip().lower() not in removed_originals]
+        if kept_certs:
+            _add_section_heading("Certifications")
+            for cert in kept_certs:
+                cleaned_cert = _clean_doc_text(cert)
+                cp = doc.add_paragraph(style="List Bullet")
+                cp.paragraph_format.space_after = Pt(0.5)
+                if " - " in cleaned_cert:
+                    issuer, rest_c = cleaned_cert.split(" - ", 1)
+                    ir = cp.add_run(f"{issuer} - ")
+                    _format_docx_run(ir, font_name=body_font, size_pt=min(body_size, 9.0), color=body_color, bold=True)
+                    rr = cp.add_run(rest_c)
+                    _format_docx_run(rr, font_name=body_font, size_pt=min(body_size, 9.0), color=body_color)
+                else:
+                    cr = cp.add_run(cleaned_cert)
+                    _format_docx_run(cr, font_name=body_font, size_pt=min(body_size, 9.0), color=body_color)
 
     output_docx_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(output_docx_path))
@@ -644,9 +779,13 @@ def convert_docx_to_pdf_and_preview(
     for p in doc.paragraphs:
         if p.text.strip():
             lines.append(p.text.strip())
+    seen_tc = set()
     for tbl in doc.tables:
         for row in tbl.rows:
             for cell in row.cells:
+                if cell._tc in seen_tc:
+                    continue
+                seen_tc.add(cell._tc)
                 for p in cell.paragraphs:
                     if p.text.strip():
                         lines.append(p.text.strip())

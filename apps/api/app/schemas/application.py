@@ -58,6 +58,11 @@ class GitHubConfirmJobResponse(BaseModel):
 class ChangeDecisionRequest(BaseModel):
     status: str = Field(pattern="^(accepted|rejected|edited|pending)$")
     edited_text: Optional[str] = None
+    accuracy_confirmed: Optional[bool] = None
+
+
+class PageFitOptionApplyRequest(BaseModel):
+    option_id: str = Field(pattern="^(shorten_projects|condense_education|drop_lowest_relevance)$")
 
 
 class ChangeResponse(BaseModel):
@@ -93,8 +98,17 @@ class ResumeVersionResponse(BaseModel):
     theme_warnings: list[str] = Field(default_factory=list)
     export_blocked: bool = False
     export_cache_key: Optional[str] = None
+    overlap_passed: Optional[bool] = None
+    overlap_details: list[dict[str, Any]] = Field(default_factory=list)
+    page_fit: Optional[dict[str, Any]] = None
+    source_verification: Optional[dict[str, Any]] = None
     changes: list[ChangeResponse] = Field(default_factory=list)
     created_at: datetime
+
+
+class SourceVerificationDecisionRequest(BaseModel):
+    item: str
+    decision: str  # "keep" | "remove"
 
 
 class ApplicationSummaryResponse(BaseModel):
@@ -129,6 +143,8 @@ class ApplicationDetailResponse(BaseModel):
     skill_assessments: list[SkillAssessmentItem] = Field(default_factory=list)
     github_recommendations: list[RepoRecommendation] = Field(default_factory=list)
     learning_plans: list[LearningPlanDetail] = Field(default_factory=list)
+    confirmed_learning: list[dict[str, Any]] = Field(default_factory=list)
+    relevance_review: list[dict[str, Any]] = Field(default_factory=list)
     versions: list[ResumeVersionResponse] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime

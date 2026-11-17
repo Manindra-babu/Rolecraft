@@ -50,9 +50,18 @@ def create_app() -> FastAPI:
         try:
             insp = inspect(engine)
             cols = {c["name"] for c in insp.get_columns("resume_versions")}
+            cols_app = {c["name"] for c in insp.get_columns("applications")} if "applications" in insp.get_table_names() else set()
             with engine.begin() as conn:
+                if "confirmed_learning" not in cols_app and "applications" in insp.get_table_names():
+                    conn.execute(text("ALTER TABLE applications ADD COLUMN confirmed_learning JSON DEFAULT '[]'"))
                 if "export_cache_key" not in cols:
                     conn.execute(text("ALTER TABLE resume_versions ADD COLUMN export_cache_key VARCHAR(128)"))
+                if "overlap_passed" not in cols:
+                    conn.execute(text("ALTER TABLE resume_versions ADD COLUMN overlap_passed BOOLEAN"))
+                if "overlap_details" not in cols:
+                    conn.execute(text("ALTER TABLE resume_versions ADD COLUMN overlap_details JSON DEFAULT '[]'"))
+                if "page_fit" not in cols:
+                    conn.execute(text("ALTER TABLE resume_versions ADD COLUMN page_fit JSON DEFAULT '{}'"))
                 conn.execute(
                     text(
                         "UPDATE resume_versions "

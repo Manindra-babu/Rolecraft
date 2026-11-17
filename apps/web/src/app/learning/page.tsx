@@ -175,7 +175,7 @@ export default function LearningPage() {
                 </div>
               </div>
 
-              <div className="flex items-center justify-between border-t border-border pt-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border pt-3">
                 <label className="flex cursor-pointer items-center gap-2 text-sm text-ink">
                   <input
                     type="checkbox"
@@ -192,10 +192,15 @@ export default function LearningPage() {
                     }}
                   />
                   <span>
-                    Confirm I am actively learning {plan.skill_name} (adds to
-                    Skill Development section only)
+                    Confirm I am actively learning {plan.skill_name} (adds{" "}
+                    &ldquo;Currently Learning&rdquo; line inside Skills section)
                   </span>
                 </label>
+                {plan.confirmation_note && (
+                  <span className="text-xs text-ink-muted">
+                    Source: {plan.confirmation_note}
+                  </span>
+                )}
               </div>
             </Card>
           ))}

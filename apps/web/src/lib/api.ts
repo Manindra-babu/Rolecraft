@@ -237,10 +237,23 @@ export interface LearningPlanDetail {
   confirmation_note: string;
 }
 
+export interface RelevanceReviewItem {
+  block_id: string;
+  section: string;
+  block_type: string;
+  text: string;
+  score: number;
+  tier: "high" | "medium" | "low";
+  matched_skills: string[];
+  recommended_action: "keep" | "shorten" | "remove" | "reorder";
+  reason: string;
+  estimated_pt_saved: number;
+}
+
 export interface ChangeItem {
   id: string;
   section: string;
-  change_type: "reworded" | "added_from_resume" | "added_from_github" | "reordered" | "removed" | "user_confirmed_skill";
+  change_type: "reworded" | "added_from_resume" | "added_from_github" | "reordered" | "removed" | "user_confirmed_skill" | "relevance_trim";
   target_location: Record<string, unknown>;
   original_text: string;
   new_text: string;
@@ -250,6 +263,26 @@ export interface ChangeItem {
   validation_status: "passed" | "flagged" | "blocked";
   validation_warnings: string[];
   status: "pending" | "accepted" | "rejected" | "edited";
+}
+
+export interface PageFitOptionPreview {
+  change_id?: string | null;
+  item_id?: string | null;
+  section?: string | null;
+  label: string;
+  before: string;
+  after: string;
+  action?: string;
+  estimated_pt_saved?: number;
+}
+
+export interface PageFitOption {
+  id: "shorten_projects" | "condense_education" | "drop_lowest_relevance";
+  title: string;
+  description: string;
+  estimated_pt_saved: number;
+  target_change_ids: string[];
+  previews: PageFitOptionPreview[];
 }
 
 export interface ResumeVersion {
@@ -265,11 +298,63 @@ export interface ResumeVersion {
   overflow_suggestions: string[];
   similarity_score?: number | null;
   unchanged_similarity_score?: number | null;
+  overlap_passed?: boolean | null;
+  overlap_details?: Array<{ page: number; span1: string; span2: string; overlap_x?: number; overlap_y?: number }>;
+  page_fit?: {
+    passed?: boolean;
+    page_count_original?: number;
+    page_count_output?: number;
+    orig_last_y1?: number;
+    out_last_y1?: number;
+    limit_y?: number;
+    margin_pt?: number;
+    low_margin?: boolean;
+    overflow?: boolean;
+    orig_bottom_margin_pt?: number;
+    out_bottom_margin_pt?: number;
+    page_height_pt?: number;
+    options?: PageFitOption[];
+    missing_blocks?: string[];
+  } | null;
   theme_warnings?: string[];
   export_blocked?: boolean;
   export_cache_key?: string | null;
+  source_verification?: SourceVerificationReport | null;
   changes: ChangeItem[];
   created_at: string;
+}
+
+export interface SourceVerificationItem {
+  item: string;
+  section: string;
+  status: "VERIFIED" | "REWORDED" | "UNSOURCED";
+  source: string;
+  file_path?: string | null;
+  line_number?: number | null;
+  original_sentence?: string | null;
+  new_sentence?: string | null;
+}
+
+export interface RemovedFromOriginalItem {
+  item: string;
+  section: string;
+  reason: string;
+}
+
+export interface ProjectSelectionItem {
+  project_name: string;
+  status: "included" | "excluded";
+  relevance_score: number;
+  reason: string;
+}
+
+export interface SourceVerificationReport {
+  items: SourceVerificationItem[];
+  removed_from_original: RemovedFromOriginalItem[];
+  project_selection: ProjectSelectionItem[];
+  can_export: boolean;
+  unsourced_count: number;
+  blocking_reasons: string[];
 }
 
 export interface ApplicationSummary {
@@ -304,6 +389,7 @@ export interface ApplicationDetail {
   skill_assessments: SkillAssessmentItem[];
   github_recommendations: RepoRecommendation[];
   learning_plans: LearningPlanDetail[];
+  relevance_review?: RelevanceReviewItem[];
   versions: ResumeVersion[];
   created_at: string;
   updated_at: string;

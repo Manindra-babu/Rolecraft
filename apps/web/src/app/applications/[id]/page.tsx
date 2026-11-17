@@ -30,6 +30,7 @@ import {
   RepoRecommendation,
   ResumeUpload,
   ResumeVersion,
+  SourceVerificationReport,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 
@@ -87,6 +88,8 @@ export default function ApplicationWorkspacePage() {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [origPreviewUrl, setOrigPreviewUrl] = useState<string | null>(null);
   const [notesDraft, setNotesDraft] = useState<string>("");
+  const [keepAiInterest, setKeepAiInterest] = useState<boolean>(false);
+  const [learningNotes, setLearningNotes] = useState<Record<string, string>>({});
 
   useEffect(() => {
     if (!isLoading && !user) router.replace("/login");
@@ -111,9 +114,31 @@ export default function ApplicationWorkspacePage() {
   }, [app, notesDraft]);
 
   const latestVersion: ResumeVersion | undefined = app?.versions?.[0];
+  const changeStatusCounts = useMemo(() => {
+    const all = latestVersion?.changes || [];
+    let accepted = 0;
+    let pending = 0;
+    let rejected = 0;
+    for (const c of all) {
+      if (c.status === "accepted" || c.status === "edited") accepted += 1;
+      else if (c.status === "rejected") rejected += 1;
+      else pending += 1;
+    }
+    return { total: all.length, accepted, pending, rejected };
+  }, [latestVersion]);
+
   const filteredChanges = useMemo(() => {
     const all = latestVersion?.changes || [];
     if (changeFilter === "all") return all;
+    if (changeFilter === "status:accepted") {
+      return all.filter((c) => c.status === "accepted" || c.status === "edited");
+    }
+    if (changeFilter === "status:pending") {
+      return all.filter((c) => c.status === "pending");
+    }
+    if (changeFilter === "status:rejected") {
+      return all.filter((c) => c.status === "rejected");
+    }
     return all.filter((c) => c.change_type === changeFilter);
   }, [latestVersion, changeFilter]);
 
@@ -199,17 +224,20 @@ export default function ApplicationWorkspacePage() {
       planId,
       confirmed,
       completedSteps,
+      note,
     }: {
       planId: string;
       confirmed: boolean;
       completedSteps: string[];
+      note?: string;
     }) =>
       apiFetch(`/learning/${planId}/progress`, {
         method: "PUT",
         body: JSON.stringify({
           completed_steps: completedSteps,
           user_confirmed_learning: confirmed,
-          confirmation_note: "confirmed from application workspace",
+          confirmation_note: (note ?? learningNotes[planId] ?? "").trim(),
+          application_id: appId,
         }),
       }),
     onSuccess: invalidateApp,
@@ -353,10 +381,15 @@ export default function ApplicationWorkspacePage() {
   };
 
   const generateMutation = useMutation({
-    mutationFn: () =>
-      apiFetch<ApplicationDetail>(`/applications/${appId}/generate`, {
-        method: "POST",
-      }),
+    mutationFn: (overrideKeepAi?: boolean) => {
+      const keep = overrideKeepAi ?? keepAiInterest;
+      return apiFetch<ApplicationDetail>(
+        `/applications/${appId}/generate?keep_ai_interest=${keep ? "true" : "false"}`,
+        {
+          method: "POST",
+        }
+      );
+    },
     onSuccess: async () => {
       setActionError(null);
       await invalidateApp();
@@ -372,14 +405,16 @@ export default function ApplicationWorkspacePage() {
       changeId,
       status,
       edited_text,
+      accuracy_confirmed,
     }: {
       changeId: string;
       status: "accepted" | "rejected" | "edited";
       edited_text?: string;
+      accuracy_confirmed?: boolean;
     }) =>
       apiFetch<ChangeItem>(`/applications/${appId}/changes/${changeId}`, {
         method: "PATCH",
-        body: JSON.stringify({ status, edited_text }),
+        body: JSON.stringify({ status, edited_text, accuracy_confirmed }),
       }),
     onSuccess: async () => {
       setActionError(null);
@@ -388,6 +423,28 @@ export default function ApplicationWorkspacePage() {
     },
     onError: (err) => {
       setActionError(err instanceof ApiError ? err.message : "Could not update change.");
+    },
+  });
+
+  const applyPageFitOptionMutation = useMutation({
+    mutationFn: ({
+      versionId,
+      optionId,
+    }: {
+      versionId: string;
+      optionId: "shorten_projects" | "condense_education" | "drop_lowest_relevance";
+    }) =>
+      apiFetch<ResumeVersion>(`/applications/${appId}/versions/${versionId}/page-fit-option`, {
+        method: "POST",
+        body: JSON.stringify({ option_id: optionId }),
+      }),
+    onSuccess: async (_data, vars) => {
+      setActionError(null);
+      await invalidateApp();
+      exportMutation.mutate({ versionId: vars.versionId, tightenSpacing: true });
+    },
+    onError: (err) => {
+      setActionError(err instanceof ApiError ? err.message : "Could not apply page-fit option.");
     },
   });
 
@@ -417,6 +474,26 @@ export default function ApplicationWorkspacePage() {
     onError: invalidateApp,
   });
 
+  const sourceDecisionMutation = useMutation({
+    mutationFn: ({
+      versionId,
+      item,
+      decision,
+    }: {
+      versionId: string;
+      item: string;
+      decision: "keep" | "remove";
+    }) =>
+      apiFetch<SourceVerificationReport>(
+        `/applications/${appId}/versions/${versionId}/source-decision`,
+        {
+          method: "POST",
+          body: JSON.stringify({ item, decision }),
+        }
+      ),
+    onSuccess: invalidateApp,
+  });
+
   const statusMutation = useMutation({
     mutationFn: (payload: { status: ApplicationSummary["status"]; notes: string }) =>
       apiFetch<ApplicationDetail>(`/applications/${appId}/status`, {
@@ -432,7 +509,10 @@ export default function ApplicationWorkspacePage() {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       const key = e.key.toLowerCase();
-      if (key === "a" && selectedChange.validation_status !== "blocked") {
+      const needsConfirm =
+        Boolean(selectedChange.target_location?.requires_confirmation) &&
+        !Boolean(selectedChange.target_location?.accuracy_confirmed);
+      if (key === "a" && selectedChange.validation_status !== "blocked" && !needsConfirm) {
         changeDecisionMutation.mutate({ changeId: selectedChange.id, status: "accepted" });
       } else if (key === "r") {
         changeDecisionMutation.mutate({ changeId: selectedChange.id, status: "rejected" });
@@ -504,7 +584,7 @@ export default function ApplicationWorkspacePage() {
   }
   const reorderedSkillMap = new Map<string, string>();
   for (const ch of acceptedChanges) {
-    if (ch.change_type === "reordered" && ch.section === "skills") {
+    if ((ch.change_type === "reordered" || ch.change_type === "reworded") && ch.section === "skills") {
       const val = ch.edited_text || ch.new_text;
       const idx = val.indexOf(":");
       if (idx > 0) {
@@ -514,9 +594,14 @@ export default function ApplicationWorkspacePage() {
       }
     }
   }
-  const summaryOverride = acceptedChanges.find(
-    (c) => c.section === "summary" && c.change_type === "reworded"
+  const removedTexts = new Set(
+    acceptedChanges
+      .filter((c) => c.change_type === "relevance_trim" && !(c.edited_text || c.new_text || "").trim())
+      .map((c) => c.original_text.trim())
   );
+  const summaryOverride = acceptedChanges.find(
+    (c) => c.section === "summary" && c.change_type === "reworded" && c.original_text.length > 50
+  ) || acceptedChanges.find((c) => c.section === "summary" && c.change_type === "reworded");
   const addedProjects = acceptedChanges.filter((c) => c.change_type === "added_from_github");
   const learningEntries = acceptedChanges.filter((c) => c.change_type === "user_confirmed_skill");
 
@@ -536,7 +621,7 @@ export default function ApplicationWorkspacePage() {
         </div>
 
         <Button
-          onClick={() => generateMutation.mutate()}
+          onClick={() => generateMutation.mutate(keepAiInterest)}
           disabled={generateMutation.isPending}
         >
           {generateMutation.isPending
@@ -666,12 +751,17 @@ export default function ApplicationWorkspacePage() {
                       <ul className="space-y-1.5 text-xs">
                         {items.map((item) => {
                           const linkedPlan =
-                            cat.key === "missing" || cat.key === "needs_development"
+                            cat.key === "missing" ||
+                            cat.key === "needs_development" ||
+                            cat.key === "under_represented"
                               ? app.learning_plans.find(
                                   (lp) =>
                                     lp.skill_name.toLowerCase() === item.skill_name.toLowerCase()
                                 )
                               : undefined;
+                          const planKey = linkedPlan?.id || item.skill_name;
+                          const noteVal =
+                            learningNotes[planKey] ?? linkedPlan?.confirmation_note ?? "";
                           return (
                             <li key={item.skill_name} className="space-y-1">
                               <div>
@@ -682,8 +772,34 @@ export default function ApplicationWorkspacePage() {
                                   ({item.importance}) — {item.evidence_summary}
                                 </span>
                               </div>
+                              {cat.key === "under_represented" && linkedPlan?.id && (
+                                <div className="flex flex-wrap items-center gap-2 text-[11px] text-amber-800 dark:text-amber-200">
+                                  <span>
+                                    Listed only in Skills with no project or experience evidence yet. Have coursework or a project to add?
+                                  </span>
+                                  <button
+                                    type="button"
+                                    className="underline font-medium hover:text-accent"
+                                    onClick={() => setActiveTab("learning")}
+                                  >
+                                    View Learning Plan
+                                  </button>
+                                </div>
+                              )}
                               {linkedPlan?.id && (
-                                <div className="flex items-center gap-2">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <input
+                                    type="text"
+                                    placeholder="Course or project you are using (optional)"
+                                    className="w-56 rounded border border-border bg-surface px-2 py-1 text-[11px] text-ink"
+                                    value={noteVal}
+                                    onChange={(e) =>
+                                      setLearningNotes((cur) => ({
+                                        ...cur,
+                                        [linkedPlan.id!]: e.target.value,
+                                      }))
+                                    }
+                                  />
                                   <Button
                                     size="sm"
                                     variant={linkedPlan.user_confirmed_learning ? "primary" : "secondary"}
@@ -693,6 +809,7 @@ export default function ApplicationWorkspacePage() {
                                         planId: linkedPlan.id!,
                                         confirmed: !linkedPlan.user_confirmed_learning,
                                         completedSteps: linkedPlan.completed_steps,
+                                        note: noteVal,
                                       })
                                     }
                                   >
@@ -926,7 +1043,7 @@ export default function ApplicationWorkspacePage() {
                 changes.
               </p>
               <div>
-                <Button onClick={() => generateMutation.mutate()}>
+                <Button onClick={() => generateMutation.mutate(keepAiInterest)}>
                   Generate Tailored Resume Changes
                 </Button>
               </div>
@@ -940,7 +1057,11 @@ export default function ApplicationWorkspacePage() {
                     { id: "reworded", label: "Reworded" },
                     { id: "added_from_github", label: "Added from GitHub" },
                     { id: "reordered", label: "Reordered" },
+                    { id: "relevance_trim", label: "Trim / Relevance" },
                     { id: "user_confirmed_skill", label: "Confirmed Learning" },
+                    { id: "status:accepted", label: `Accepted (${changeStatusCounts.accepted})` },
+                    { id: "status:pending", label: `Pending (${changeStatusCounts.pending})` },
+                    { id: "status:rejected", label: `Rejected (${changeStatusCounts.rejected})` },
                   ].map((f) => (
                     <button
                       key={f.id}
@@ -957,7 +1078,19 @@ export default function ApplicationWorkspacePage() {
                   ))}
                 </div>
 
-                <div className="flex items-center gap-3">
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="flex cursor-pointer items-center gap-1.5 rounded border border-border bg-surface px-2.5 py-1 text-xs text-ink">
+                    <input
+                      type="checkbox"
+                      checked={keepAiInterest}
+                      onChange={(e) => {
+                        const next = e.target.checked;
+                        setKeepAiInterest(next);
+                        generateMutation.mutate(next);
+                      }}
+                    />
+                    Keep my AI interest in Summary
+                  </label>
                   <span className="text-xs text-ink-muted">
                     Shortcuts: <kbd className="rounded border px-1">A</kbd> accept,{" "}
                     <kbd className="rounded border px-1">R</kbd> reject,{" "}
@@ -1025,7 +1158,8 @@ export default function ApplicationWorkspacePage() {
                               </div>
                             </div>
                             <p className="mt-1 line-clamp-2 text-ink-muted">
-                              {ch.edited_text || ch.new_text}
+                              {(ch.edited_text || ch.new_text) ||
+                                "(Remove low-relevance item to save space)"}
                             </p>
                           </button>
                         );
@@ -1077,6 +1211,52 @@ export default function ApplicationWorkspacePage() {
                         </Alert>
                       )}
 
+                      {Boolean(selectedChange.target_location?.requires_confirmation) &&
+                        !Boolean(selectedChange.target_location?.accuracy_confirmed) && (
+                          <Alert
+                            tone="warning"
+                            title="Accuracy confirmation required"
+                          >
+                            <p className="text-xs font-medium text-ink">
+                              {String(
+                                selectedChange.target_location?.accuracy_prompt ||
+                                  "Confirm this technology was used before applying."
+                              )}
+                            </p>
+                            <div className="mt-2 flex flex-wrap gap-2">
+                              <Button
+                                size="sm"
+                                disabled={changeDecisionMutation.isPending}
+                                onClick={() =>
+                                  changeDecisionMutation.mutate({
+                                    changeId: selectedChange.id,
+                                    status: "accepted",
+                                    accuracy_confirmed: true,
+                                  })
+                                }
+                              >
+                                Yes, used MongoDB (confirm &amp; accept)
+                              </Button>
+                              {typeof selectedChange.target_location?.without_mongodb === "string" && (
+                                <Button
+                                  size="sm"
+                                  variant="secondary"
+                                  disabled={changeDecisionMutation.isPending}
+                                  onClick={() =>
+                                    changeDecisionMutation.mutate({
+                                      changeId: selectedChange.id,
+                                      status: "accepted",
+                                      accuracy_confirmed: false,
+                                    })
+                                  }
+                                >
+                                  No, used Firebase (use Express.js, React, Node.js)
+                                </Button>
+                              )}
+                            </div>
+                          </Alert>
+                        )}
+
                       <div className="grid gap-3 sm:grid-cols-2">
                         <div className="rounded-md border border-border bg-canvas p-3">
                           <p className="text-xs font-semibold uppercase tracking-wider text-ink-muted">
@@ -1098,9 +1278,58 @@ export default function ApplicationWorkspacePage() {
                               onChange={(e) => setEditingText(e.target.value)}
                             />
                           ) : (
-                            <p className="mt-1.5 whitespace-pre-wrap text-xs leading-relaxed text-ink">
-                              {selectedChange.edited_text || selectedChange.new_text}
-                            </p>
+                            <div className="mt-1.5 space-y-1.5">
+                              {!(selectedChange.edited_text ?? selectedChange.new_text) &&
+                              selectedChange.change_type === "relevance_trim" ? (
+                                <p className="text-xs italic text-amber-800">
+                                  (Remove low-relevance item to reclaim vertical space on page 1)
+                                </p>
+                              ) : (
+                                <p className="whitespace-pre-wrap text-xs leading-relaxed text-ink">
+                                  {selectedChange.edited_text || selectedChange.new_text}
+                                </p>
+                              )}
+                              {selectedChange.section === "summary" &&
+                                typeof selectedChange.target_location?.alt_with_ai_interest ===
+                                  "string" && (() => {
+                                  const altWithAi = String(
+                                    selectedChange.target_location?.alt_with_ai_interest ?? ""
+                                  );
+                                  const currentSummary =
+                                    selectedChange.edited_text || selectedChange.new_text || "";
+                                  const isShowingAi =
+                                    currentSummary.includes("Artificial Intelligence") ||
+                                    currentSummary === altWithAi;
+                                  return (
+                                    <div className="flex flex-wrap items-center gap-2 pt-1">
+                                      <Button
+                                        size="sm"
+                                        variant="secondary"
+                                        disabled={changeDecisionMutation.isPending}
+                                        onClick={() => {
+                                          setKeepAiInterest(!isShowingAi);
+                                          changeDecisionMutation.mutate({
+                                            changeId: selectedChange.id,
+                                            status: "edited",
+                                            edited_text: isShowingAi
+                                              ? selectedChange.new_text
+                                              : altWithAi,
+                                          });
+                                        }}
+                                      >
+                                        {isShowingAi
+                                          ? "Omit AI/LLM interest sentence"
+                                          : "Retain AI/LLM interest sentence"}
+                                      </Button>
+                                      <span className="text-[11px] text-muted">
+                                        {isShowingAi
+                                          ? "AI/LLM sentence retained"
+                                          : "AI/LLM sentence omitted (toggleable)"}
+                                      </span>
+                                    </div>
+                                  );
+                                })()}
+                            </div>
                           )}
                         </div>
                       </div>
@@ -1148,7 +1377,11 @@ export default function ApplicationWorkspacePage() {
                           <>
                             <Button
                               size="sm"
-                              disabled={selectedChange.validation_status === "blocked"}
+                              disabled={
+                                selectedChange.validation_status === "blocked" ||
+                                (Boolean(selectedChange.target_location?.requires_confirmation) &&
+                                  !Boolean(selectedChange.target_location?.accuracy_confirmed))
+                              }
                               onClick={() =>
                                 changeDecisionMutation.mutate({
                                   changeId: selectedChange.id,
@@ -1242,9 +1475,11 @@ export default function ApplicationWorkspacePage() {
                                   {exp.company ? `— ${exp.company}` : ""}
                                 </p>
                                 <ul className="list-disc space-y-0.5 pl-4">
-                                  {exp.bullets.map((b, bi) => (
-                                    <li key={bi}>{rewordMap.get(b) || b}</li>
-                                  ))}
+                                  {exp.bullets
+                                    .filter((b) => !removedTexts.has(b))
+                                    .map((b, bi) => (
+                                      <li key={bi}>{rewordMap.get(b) || b}</li>
+                                    ))}
                                 </ul>
                               </div>
                             ))}
@@ -1292,39 +1527,43 @@ export default function ApplicationWorkspacePage() {
                                     </li>
                                   )
                                 )}
+                                {learningEntries.map((ch) => (
+                                  <li key={ch.id}>
+                                    <span className="font-semibold">Currently Learning:</span>{" "}
+                                    {(ch.edited_text || ch.new_text).replace(
+                                      /^Currently Learning:\s*/i,
+                                      ""
+                                    )}
+                                  </li>
+                                ))}
                               </ul>
                             ) : (
-                              <p className="mt-1">
-                                {reorderedSkillMap.get("_flat") ||
-                                  resume.parsed_structure.skills.join(", ")}
-                              </p>
+                              <div className="mt-1 space-y-0.5">
+                                <p>
+                                  {reorderedSkillMap.get("_flat") ||
+                                    resume.parsed_structure.skills.join(", ")}
+                                </p>
+                                {learningEntries.map((ch) => (
+                                  <p key={ch.id}>{ch.edited_text || ch.new_text}</p>
+                                ))}
+                              </div>
                             )}
                           </div>
                         )}
 
-                        {resume.parsed_structure.certifications.length > 0 && (
+                        {resume.parsed_structure.certifications.filter((c) => !removedTexts.has(c))
+                          .length > 0 && (
                           <div>
                             <p className="border-b border-border pb-0.5 font-sans text-[11px] font-semibold uppercase tracking-wider">
                               Certifications
                             </p>
                             <ul className="mt-1 list-disc space-y-0.5 pl-4">
-                              {resume.parsed_structure.certifications.map((cert, ci) => (
-                                <li key={ci}>{cert}</li>
-                              ))}
+                              {resume.parsed_structure.certifications
+                                .filter((c) => !removedTexts.has(c))
+                                .map((cert, ci) => (
+                                  <li key={ci}>{cert}</li>
+                                ))}
                             </ul>
-                          </div>
-                        )}
-
-                        {learningEntries.length > 0 && (
-                          <div>
-                            <p className="border-b border-border pb-0.5 font-sans text-[11px] font-semibold uppercase tracking-wider">
-                              Skill Development
-                            </p>
-                            {learningEntries.map((ch) => (
-                              <p key={ch.id} className="mt-1">
-                                {ch.edited_text || ch.new_text}
-                              </p>
-                            ))}
                           </div>
                         )}
                       </>
@@ -1333,6 +1572,60 @@ export default function ApplicationWorkspacePage() {
                     )}
                   </div>
                 </Card>
+
+                {app.relevance_review && app.relevance_review.length > 0 && (
+                  <Card className="lg:col-span-2 space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <p className="text-sm font-semibold text-ink">
+                          Relevance Review (every resume block scored)
+                        </p>
+                        <p className="text-xs text-ink-muted">
+                          High-relevance blocks are preserved; low-relevance items have pending
+                          trim proposals in the Change List when space is needed.
+                        </p>
+                      </div>
+                      <Badge tone="neutral">
+                        {app.relevance_review.filter((r) => r.tier === "low").length} low-relevance
+                        trim candidates
+                      </Badge>
+                    </div>
+                    <div className="max-h-60 overflow-y-auto divide-y divide-border rounded-md border border-border">
+                      {app.relevance_review.map((item) => (
+                        <div
+                          key={item.block_id}
+                          className="flex flex-wrap items-start justify-between gap-2 px-3 py-2 text-xs"
+                        >
+                          <div className="min-w-0 flex-1 space-y-0.5">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-semibold capitalize text-ink">
+                                {item.section}
+                              </span>
+                              <Badge
+                                tone={
+                                  item.tier === "high"
+                                    ? "success"
+                                    : item.tier === "medium"
+                                    ? "neutral"
+                                    : "warning"
+                                }
+                              >
+                                {Math.round(item.score * 100)}% ({item.tier})
+                              </Badge>
+                              {item.recommended_action !== "keep" && (
+                                <Badge tone="warning">
+                                  Suggest {item.recommended_action} (~{item.estimated_pt_saved}pt)
+                                </Badge>
+                              )}
+                            </div>
+                            <p className="truncate text-ink">{item.text}</p>
+                            <p className="text-[11px] text-ink-muted">{item.reason}</p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </Card>
+                )}
               </div>
             </>
           )}
@@ -1351,25 +1644,37 @@ export default function ApplicationWorkspacePage() {
               <Card key={plan.skill_name} className="space-y-2">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <h3 className="text-base font-semibold">{plan.skill_name}</h3>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <Badge tone="warning">{plan.category.replace("_", " ")}</Badge>
                     {plan.id && (
-                      <Button
-                        size="sm"
-                        variant={plan.user_confirmed_learning ? "primary" : "secondary"}
-                        disabled={confirmLearningMutation.isPending}
-                        onClick={() =>
-                          confirmLearningMutation.mutate({
-                            planId: plan.id!,
-                            confirmed: !plan.user_confirmed_learning,
-                            completedSteps: plan.completed_steps,
-                          })
-                        }
-                      >
-                        {plan.user_confirmed_learning
-                          ? "Currently Learning (Confirmed)"
-                          : "Mark as Currently Learning"}
-                      </Button>
+                      <>
+                        <input
+                          type="text"
+                          value={learningNotes[plan.id] ?? plan.confirmation_note ?? ""}
+                          onChange={(e) =>
+                            setLearningNotes((prev) => ({ ...prev, [plan.id!]: e.target.value }))
+                          }
+                          placeholder="Course or project you are using (optional)..."
+                          className="w-60 rounded border border-border bg-white px-2 py-1 text-xs text-ink"
+                        />
+                        <Button
+                          size="sm"
+                          variant={plan.user_confirmed_learning ? "primary" : "secondary"}
+                          disabled={confirmLearningMutation.isPending}
+                          onClick={() =>
+                            confirmLearningMutation.mutate({
+                              planId: plan.id!,
+                              confirmed: !plan.user_confirmed_learning,
+                              completedSteps: plan.completed_steps,
+                              note: (learningNotes[plan.id!] ?? plan.confirmation_note ?? "").trim() || undefined,
+                            })
+                          }
+                        >
+                          {plan.user_confirmed_learning
+                            ? "Currently Learning (Confirmed)"
+                            : "Mark as Currently Learning"}
+                        </Button>
+                      </>
                     )}
                   </div>
                 </div>
@@ -1398,16 +1703,171 @@ export default function ApplicationWorkspacePage() {
 
             {latestVersion ? (
               <div className="space-y-4">
-                <Button
-                  onClick={() => exportMutation.mutate({ versionId: latestVersion.id })}
-                  disabled={exportMutation.isPending}
-                >
-                  {exportMutation.isPending
-                    ? "Preserving theme & rendering..."
-                    : app.resume_file_type === "pdf"
-                    ? "Build Theme-Preserved PDF & DOCX"
-                    : "Build Final DOCX & PDF"}
-                </Button>
+                {/* Source Verification Section */}
+                {latestVersion.source_verification && (
+                  <div className="space-y-4 rounded-lg border border-border p-4 bg-surface">
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border pb-3">
+                      <div>
+                        <h3 className="text-base font-semibold text-ink">Source Verification</h3>
+                        <p className="text-xs text-ink-muted">
+                          Proves that every claim comes from your real data (original resume, GitHub repos, or master profile).
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Badge tone={latestVersion.source_verification.can_export ? "success" : "danger"}>
+                          {latestVersion.source_verification.can_export
+                            ? "All Claims Verified"
+                            : `${latestVersion.source_verification.unsourced_count} Unsourced Claim(s)`}
+                        </Badge>
+                      </div>
+                    </div>
+
+                    {/* Source Verification Table */}
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs border-collapse">
+                        <thead>
+                          <tr className="border-b border-border text-ink-muted">
+                            <th className="py-2 pr-3 font-semibold">Item</th>
+                            <th className="py-2 px-3 font-semibold">Status</th>
+                            <th className="py-2 px-3 font-semibold">Source (file + line)</th>
+                            <th className="py-2 pl-3 font-semibold">Action</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-border/60">
+                          {latestVersion.source_verification.items.map((it, idx) => (
+                            <tr key={idx} className="hover:bg-canvas/50">
+                              <td className="py-2.5 pr-3 font-medium text-ink max-w-xs">
+                                <div>{it.item}</div>
+                                {it.status === "REWORDED" && it.original_sentence && (
+                                  <div className="text-[11px] text-ink-muted mt-0.5">
+                                    <span className="font-semibold text-amber-600 dark:text-amber-400">Original:</span> {it.original_sentence}
+                                  </div>
+                                )}
+                              </td>
+                              <td className="py-2.5 px-3">
+                                <Badge
+                                  tone={
+                                    it.status === "VERIFIED"
+                                      ? "success"
+                                      : it.status === "REWORDED"
+                                      ? "neutral"
+                                      : "danger"
+                                  }
+                                >
+                                  {it.status}
+                                </Badge>
+                              </td>
+                              <td className="py-2.5 px-3 font-mono text-[11px] text-ink-muted max-w-xs truncate" title={it.source}>
+                                {it.source}
+                              </td>
+                              <td className="py-2.5 pl-3">
+                                {it.status === "UNSOURCED" ? (
+                                  <div className="flex items-center gap-1.5">
+                                    <Button
+                                      size="sm"
+                                      variant="secondary"
+                                      disabled={sourceDecisionMutation.isPending}
+                                      onClick={() =>
+                                        sourceDecisionMutation.mutate({
+                                          versionId: latestVersion.id,
+                                          item: it.item,
+                                          decision: "keep",
+                                        })
+                                      }
+                                    >
+                                      Keep
+                                    </Button>
+                                    <Button
+                                      size="sm"
+                                      variant="danger"
+                                      disabled={sourceDecisionMutation.isPending}
+                                      onClick={() =>
+                                        sourceDecisionMutation.mutate({
+                                          versionId: latestVersion.id,
+                                          item: it.item,
+                                          decision: "remove",
+                                        })
+                                      }
+                                    >
+                                      Remove
+                                    </Button>
+                                  </div>
+                                ) : (
+                                  <span className="text-[11px] text-ink-muted">—</span>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {/* Removed from original */}
+                    <div className="space-y-2 border-t border-border pt-3">
+                      <h4 className="text-xs font-semibold uppercase tracking-wider text-ink-muted">
+                        Removed from original
+                      </h4>
+                      {latestVersion.source_verification.removed_from_original.length > 0 ? (
+                        <ul className="space-y-1.5 text-xs">
+                          {latestVersion.source_verification.removed_from_original.map((rm, i) => (
+                            <li key={i} className="flex flex-col rounded bg-canvas p-2 border border-border/70">
+                              <span className="font-semibold text-ink">
+                                [{rm.section.toUpperCase()}] {rm.item}
+                              </span>
+                              <span className="text-ink-muted text-[11px] mt-0.5">{rm.reason}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="text-xs text-ink-muted">No items removed from original resume.</p>
+                      )}
+                    </div>
+
+                    {/* Why projects were chosen/excluded */}
+                    <div className="space-y-2 border-t border-border pt-3">
+                      <h4 className="text-xs font-semibold uppercase tracking-wider text-ink-muted">
+                        Why projects were chosen/excluded
+                      </h4>
+                      <ul className="space-y-1.5 text-xs">
+                        {latestVersion.source_verification.project_selection.map((ps, i) => (
+                          <li key={i} className="flex flex-col rounded bg-canvas p-2 border border-border/70">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-semibold text-ink">{ps.project_name}</span>
+                              <div className="flex items-center gap-1.5">
+                                <Badge tone={ps.status === "included" ? "success" : "neutral"}>
+                                  {ps.status.toUpperCase()}
+                                </Badge>
+                                <span className="text-[11px] font-mono text-ink-muted">
+                                  Score: {ps.relevance_score.toFixed(1)}
+                                </span>
+                              </div>
+                            </div>
+                            <span className="text-ink-muted text-[11px] mt-1">{ps.reason}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                )}
+
+                <div className="space-y-1.5">
+                  <Button
+                    onClick={() => exportMutation.mutate({ versionId: latestVersion.id })}
+                    disabled={
+                      exportMutation.isPending ||
+                      Boolean(latestVersion.source_verification && !latestVersion.source_verification.can_export)
+                    }
+                  >
+                    {exportMutation.isPending
+                      ? "Preserving theme & rendering..."
+                      : "Approve and export"}
+                  </Button>
+                  {latestVersion.source_verification && !latestVersion.source_verification.can_export && (
+                    <p className="text-xs text-rose-600 dark:text-rose-400 font-medium">
+                      Approve and export is enabled only when there are no UNSOURCED items.
+                    </p>
+                  )}
+                </div>
 
                 {latestVersion.similarity_score != null && (
                   <div className="flex flex-wrap items-center gap-2 text-xs">
@@ -1424,8 +1884,39 @@ export default function ApplicationWorkspacePage() {
                     <Badge tone="neutral">
                       Overall layout similarity: {latestVersion.similarity_score}%
                     </Badge>
+                    {latestVersion.overlap_passed != null && (
+                      <Badge tone={latestVersion.overlap_passed ? "success" : "danger"}>
+                        {latestVersion.overlap_passed
+                          ? "Overlap check: Passed (0 overlaps)"
+                          : `Overlap check: Failed (${latestVersion.overlap_details?.length ?? 1} conflict)`}
+                      </Badge>
+                    )}
+                    {latestVersion.page_fit &&
+                      latestVersion.page_fit.passed != null && (
+                        <Badge tone={latestVersion.page_fit.passed ? "success" : "danger"}>
+                          {latestVersion.page_fit.passed
+                            ? `Page fit: ${latestVersion.page_fit.margin_pt ?? "—"}pt margin (${latestVersion.page_fit.out_last_y1 ?? "—"}pt vs ${latestVersion.page_fit.limit_y ?? "—"}pt limit)`
+                            : `Page fit blocked: ${latestVersion.page_fit.margin_pt ?? "—"}pt margin (${latestVersion.page_fit.out_last_y1 ?? "—"}pt vs ${latestVersion.page_fit.limit_y ?? "—"}pt limit, need >= 12pt)`}
+                        </Badge>
+                      )}
                   </div>
                 )}
+
+                {latestVersion.page_fit?.missing_blocks &&
+                  latestVersion.page_fit.missing_blocks.length > 0 && (
+                    <Alert
+                      tone="danger"
+                      title={`Export blocked: ${latestVersion.page_fit.missing_blocks.length} original content block(s) missing without accepted removal`}
+                    >
+                      <ul className="mt-1 list-disc pl-4 text-xs">
+                        {latestVersion.page_fit.missing_blocks.map((blk, i) => (
+                          <li key={i} className="font-mono text-[11px]">
+                            {blk}
+                          </li>
+                        ))}
+                      </ul>
+                    </Alert>
+                  )}
 
                 {latestVersion.theme_warnings &&
                   latestVersion.theme_warnings.length > 0 && (
@@ -1433,7 +1924,7 @@ export default function ApplicationWorkspacePage() {
                       tone={latestVersion.export_blocked ? "danger" : "warning"}
                       title={
                         latestVersion.export_blocked
-                          ? "Export blocked: unexpected layout diff"
+                          ? "Export blocked: layout or page-fit check failed"
                           : "Theme & font notices"
                       }
                     >
@@ -1445,33 +1936,99 @@ export default function ApplicationWorkspacePage() {
                     </Alert>
                   )}
 
-                {latestVersion.overflow_detected && (
-                  <Alert tone="warning" title="One-page constraint: additions exceed 1 page">
-                    <ul className="list-disc pl-4 text-xs">
-                      {latestVersion.overflow_suggestions.map((s, i) => (
-                        <li key={i}>{s}</li>
-                      ))}
-                    </ul>
+                {(latestVersion.overflow_detected ||
+                  latestVersion.page_fit?.passed === false) && (
+                  <Alert
+                    tone="warning"
+                    title={`Page-fit margin ${
+                      latestVersion.page_fit?.margin_pt != null
+                        ? `${latestVersion.page_fit.margin_pt}pt (vs ${latestVersion.page_fit.limit_y}pt limit)`
+                        : "under 12pt or overflows Page 1"
+                    } — choose an option`}
+                  >
+                    {latestVersion.page_fit?.options &&
+                    latestVersion.page_fit.options.length > 0 ? (
+                      <div className="mt-2 space-y-2.5">
+                        {latestVersion.page_fit.options.map((opt) => (
+                          <div
+                            key={opt.id}
+                            className="rounded-md border border-border bg-surface p-2.5 text-xs"
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div>
+                                <p className="font-semibold text-ink">
+                                  {opt.title}{" "}
+                                  <span className="font-normal text-ink-muted">
+                                    (~{opt.estimated_pt_saved}pt saved)
+                                  </span>
+                                </p>
+                                <p className="text-[11px] text-ink-muted">
+                                  {opt.description}
+                                </p>
+                              </div>
+                              <Button
+                                size="sm"
+                                variant="secondary"
+                                disabled={
+                                  applyPageFitOptionMutation.isPending ||
+                                  exportMutation.isPending
+                                }
+                                onClick={() =>
+                                  applyPageFitOptionMutation.mutate({
+                                    versionId: latestVersion.id,
+                                    optionId: opt.id,
+                                  })
+                                }
+                              >
+                                {applyPageFitOptionMutation.isPending
+                                  ? "Applying..."
+                                  : "Choose & Re-export"}
+                              </Button>
+                            </div>
+                            {opt.previews && opt.previews.length > 0 && (
+                              <div className="mt-2 space-y-1.5 border-t border-border/70 pt-2">
+                                {opt.previews.map((pv, idx) => (
+                                  <div
+                                    key={idx}
+                                    className="grid gap-1.5 rounded bg-canvas p-1.5 text-[11px] sm:grid-cols-2"
+                                  >
+                                    <div>
+                                      <span className="font-semibold text-ink-muted">
+                                        {pv.label} (before):{" "}
+                                      </span>
+                                      <span className="text-ink-muted">
+                                        {pv.before}
+                                      </span>
+                                    </div>
+                                    <div>
+                                      <span className="font-semibold text-accent">
+                                        After:{" "}
+                                      </span>
+                                      <span className="text-ink">
+                                        {pv.after}
+                                      </span>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <ul className="list-disc pl-4 text-xs">
+                        {latestVersion.overflow_suggestions.map((s, i) => (
+                          <li key={i}>{s}</li>
+                        ))}
+                      </ul>
+                    )}
                     <div className="mt-2 flex flex-wrap gap-2">
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        disabled={exportMutation.isPending}
-                        onClick={() =>
-                          exportMutation.mutate({
-                            versionId: latestVersion.id,
-                            tightenSpacing: true,
-                          })
-                        }
-                      >
-                        Tighten section spacing &amp; rebuild
-                      </Button>
                       <Button
                         size="sm"
                         variant="ghost"
                         onClick={() => setActiveTab("review")}
                       >
-                        Trim bullets or reject a project
+                        Open Review Changes
                       </Button>
                     </div>
                   </Alert>

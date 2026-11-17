@@ -229,7 +229,18 @@ def parse_lines_to_structure(
     summary_texts = [_clean_glyphs(el["text"]) for el in section_buckets["summary"] if _clean_glyphs(el["text"])]
     if not summary_texts and extra_summary_parts:
         summary_texts = extra_summary_parts
-    structure.summary = " ".join(summary_texts).strip()
+    cleaned_summary_parts = []
+    for txt in summary_texts:
+        cleaned_t = re.sub(r"^Detail-\s*Detail-oriented\b", "Detail-oriented", txt)
+        cleaned_t = re.sub(r"\bDetail-\s+Detail-oriented\b", "Detail-oriented", cleaned_t)
+        cleaned_summary_parts.append(cleaned_t)
+    structure.summary = " ".join(cleaned_summary_parts).strip()
+    structure.summary = re.sub(r"^Detail-\s*Detail-oriented\b", "Detail-oriented", structure.summary)
+    structure.summary = re.sub(r"\bDetail-\s+Detail-oriented\b", "Detail-oriented", structure.summary)
+    for el in section_buckets.get("summary", []):
+        if el.get("text"):
+            el["text"] = re.sub(r"^Detail-\s*Detail-oriented\b", "Detail-oriented", el["text"])
+            el["text"] = re.sub(r"\bDetail-\s+Detail-oriented\b", "Detail-oriented", el["text"])
     if structure.summary and "summary" not in structure.sections_order:
         structure.sections_order.insert(0, "summary")
 

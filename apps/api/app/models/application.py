@@ -37,6 +37,9 @@ class Application(Base, TimestampMixin):
     github_recommendations: Mapped[list[dict[str, Any]]] = mapped_column(
         JSON, default=list, nullable=False
     )
+    confirmed_learning: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
 
     user: Mapped["User"] = relationship(back_populates="applications")
     versions: Mapped[list["ResumeVersion"]] = relationship(
@@ -74,6 +77,10 @@ class ResumeVersion(Base, TimestampMixin):
     theme_warnings: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     export_blocked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     export_cache_key: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    overlap_passed: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    overlap_details: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+    page_fit: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    source_verification: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
     application: Mapped["Application"] = relationship(back_populates="versions")
     changes: Mapped[list["Change"]] = relationship(

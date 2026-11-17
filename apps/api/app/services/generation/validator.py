@@ -132,6 +132,7 @@ def validate_claim_against_evidence(
     github_repos: list[AnalyzedRepo] | None = None,
     confirmed_learning: list[dict[str, Any]] | None = None,
     section: str = "",
+    change_type: str = "",
 ) -> ValidationResult:
     """
     Deterministic truthfulness + structural integrity validation layer.
@@ -141,6 +142,12 @@ def validate_claim_against_evidence(
     """
     integrity_errors: list[str] = []
     stripped_new = (new_text or "").strip()
+    if change_type == "relevance_trim" and not stripped_new:
+        return ValidationResult(
+            status="passed",
+            warnings=[],
+            evidence_refs=[{"source": "relevance_review", "detail": "Pending low-relevance trim suggestion."}],
+        )
     if not stripped_new:
         integrity_errors.append("Integrity check failed: proposed item cannot be empty.")
 
@@ -166,7 +173,11 @@ def validate_claim_against_evidence(
         orig_cat_m = re.match(r"^\s*([A-Za-z][A-Za-z &/+]{1,35}):\s*", original_text or "")
         if orig_cat_m:
             expected_label = orig_cat_m.group(1).strip()
-            if not stripped_new.lower().startswith(f"{expected_label.lower()}:"):
+            is_valid_cat_match = (
+                stripped_new.lower().startswith(f"{expected_label.lower()}:")
+                or (expected_label.lower() == "web technologies" and stripped_new.lower().startswith("web technologies / web services & architecture:"))
+            )
+            if not is_valid_cat_match:
                 integrity_errors.append(
                     f"Integrity check failed: skill category label '{expected_label}:' must be preserved."
                 )
