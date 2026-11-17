@@ -62,6 +62,8 @@ def create_app() -> FastAPI:
                     conn.execute(text("ALTER TABLE resume_versions ADD COLUMN overlap_details JSON DEFAULT '[]'"))
                 if "page_fit" not in cols:
                     conn.execute(text("ALTER TABLE resume_versions ADD COLUMN page_fit JSON DEFAULT '{}'"))
+                if "source_verification" not in cols:
+                    conn.execute(text("ALTER TABLE resume_versions ADD COLUMN source_verification JSON DEFAULT '{}'"))
                 conn.execute(
                     text(
                         "UPDATE resume_versions "
