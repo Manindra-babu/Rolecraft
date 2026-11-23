@@ -181,10 +181,17 @@ def run_github_confirm_job(job_id: str, db: Session | None = None) -> dict[str, 
             )
         except (LLMServiceError, Exception) as exc:
             logger.warning("GitHub confirm generation error job_id=%s err=%s", job_id, type(exc).__name__)
+            exc_str = str(exc)
+            if "quota" in exc_str.lower() or "429" in exc_str or "resource_exhausted" in exc_str.lower():
+                msg = "Gemini API quota exceeded for your key. Please check your plan/quota in Google AI Studio and try again."
+            elif "timeout" in exc_str.lower():
+                msg = "Request to Gemini API timed out. Please try again."
+            else:
+                msg = "Something went wrong generating project descriptions. Please try again."
             return _fail(
                 job_row,
                 code="LLM_ERROR",
-                message="Something went wrong generating project descriptions. Please try again.",
+                message=msg,
             )
 
         if not confirmed_recs:

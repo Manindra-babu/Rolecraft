@@ -37,8 +37,8 @@ class Settings(BaseSettings):
 
     # LLM settings (user supplies own Gemini key; no global GEMINI_API_KEY required)
     LLM_PROVIDER: str = "gemini"
-    GEMINI_FAST_MODEL: str = "gemini-3.8-flash"
-    GEMINI_QUALITY_MODEL: str = "gemini-3.8-flash"
+    GEMINI_FAST_MODEL: str = "gemini-2.5-flash"
+    GEMINI_QUALITY_MODEL: str = "gemini-2.5-flash"
     GEMINI_EMBEDDING_MODEL: str = "gemini-embedding-001"
     ANTHROPIC_API_KEY: str = ""
     ANTHROPIC_MODEL: str = "claude-sonnet-4-20250514"
