@@ -14,13 +14,18 @@ JOB_SIGNAL_WORDS = (
     "qualifications",
     "experience",
     "skills",
+    "skill",
+    "required",
     "engineering",
     "developer",
     "intern",
+    "internship",
     "software",
     "apply",
     "role",
     "team",
+    "mentor",
+    "tasks",
 )
 
 
@@ -58,8 +63,17 @@ def validate_extracted_job(
         score += 0.1
     score = round(min(1.0, score), 2)
 
-    if not fields.title and signal_hits < 2:
-        return False, score, "Page does not appear to contain a job posting."
+    if not fields.title:
+        # If skills and responsibilities are clearly present, provide a sensible title fallback
+        if fields.required_skills and (fields.responsibilities or len(fields.required_skills) >= 2):
+            fields.title = f"{fields.required_skills[0]} Specialist"
+            score += 0.3
+            score = round(min(1.0, score), 2)
+        elif signal_hits < 2:
+            return False, score, "Page does not appear to contain a job posting. Please include the job title and requirements."
+        else:
+            return False, score, "Could not detect a job title. Please add a title (e.g. 'Job Title: AI / ML Intern') at the top."
+
     if score < 0.35:
         return False, score, "Extracted content lacks clear job title, skills, or responsibilities."
 

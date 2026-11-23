@@ -563,7 +563,8 @@ def _structure_with_llm(
         "3. Put behavioral traits, soft requirements, degree/graduation rules, and engineering duties "
         "(e.g. 'building, breaking, and rebuilding software applications') ONLY in `responsibilities_or_soft_requirements` "
         "and `responsibilities`, NEVER in `required_skills` or `preferred_skills`.\n"
-        "4. Put any 'any one of the following' / 'any or multiple of the following' skill alternatives as lists inside `or_groups`.\n\n"
+        "4. Put any 'any one of the following' / 'any or multiple of the following' skill alternatives as lists inside `or_groups`.\n"
+        "5. If no job title is explicitly stated in the text, infer a sensible title (e.g. 'AI / ML Intern' or 'Software Engineer') based on the requirements.\n\n"
         f"Title hint: {title_hint}\nCompany hint: {company_hint}\n\n"
         f"JOB TEXT:\n{raw_text[:12000]}"
     )
