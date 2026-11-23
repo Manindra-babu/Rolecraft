@@ -18,7 +18,10 @@ from app.services.generation.optimizer import (
     build_added_from_github_change,
     generate_tailored_changes,
 )
-from app.services.github.client import generate_repo_bullets_with_evidence
+from app.services.github.client import (
+    build_factual_repo_bullets_with_evidence,
+    generate_repo_bullets_with_evidence,
+)
 from app.services.llm.base import LLMKeyInvalidError, LLMRateLimitError, LLMServiceError
 from app.services.llm.factory import get_llm_client_for_user
 
@@ -148,13 +151,22 @@ def run_github_confirm_job(job_id: str, db: Session | None = None) -> dict[str, 
                     rec.decision = "approved"
                     rec.omitted_for_space = False
                     analyzed_repo = repos_by_name.get(rec.repo_name) or _minimal_analyzed_repo(rec)
-                    bullets, bullet_evidence = generate_repo_bullets_with_evidence(
-                        analyzed_repo,
-                        db=session,
-                        user=user,
-                        raise_on_llm_error=True,
-                        llm=llm,
-                    )
+                    try:
+                        bullets, bullet_evidence = generate_repo_bullets_with_evidence(
+                            analyzed_repo,
+                            db=session,
+                            user=user,
+                            raise_on_llm_error=True,
+                            llm=llm,
+                        )
+                    except LLMKeyInvalidError:
+                        raise
+                    except (LLMRateLimitError, LLMServiceError):
+                        logger.warning(
+                            "LLM call rate-limited or failed for repo %s; falling back to deterministic repo evidence",
+                            rec.repo_name,
+                        )
+                        bullets, bullet_evidence = build_factual_repo_bullets_with_evidence(analyzed_repo)
                     rec.draft_bullets = bullets
                     rec.bullet_evidence = bullet_evidence
                     confirmed_recs.append(rec)
